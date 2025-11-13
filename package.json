@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest",
     "test:ci": "vitest run --coverage",
-    "check": "pnpm typecheck && pnpm lint && pnpm test"
+    "check": "pnpm typecheck && pnpm lint && pnpm test",
+    "smoke": "node ./scripts/smoke.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -13,15 +13,17 @@ Hardening pass for the Sprint 0 platform baseline: a Tauri + React desktop harne
 
 Run these from the repository root:
 
-- `pnpm dev` – Vite front-end in watch mode.
-- `pnpm tauri dev` – full-stack desktop shell.
-- `pnpm lint` / `pnpm typecheck` / `pnpm test` – JS/TS quality gates (also combined via `pnpm check`).
-- `cargo test -p tauri-app` – Rust unit tests (SQLCipher bootstrap, telemetry buffer, vault helpers).
+- `pnpm dev` - Vite front-end in watch mode.
+- `pnpm tauri dev` - full-stack desktop shell.
+- `pnpm lint` / `pnpm typecheck` / `pnpm test` - JS/TS quality gates (also combined via `pnpm check`).
+- `pnpm smoke` - one-touch harness used by CI (lint -> typecheck -> vitest run -> `cargo test -p tauri-app`).
+- `cargo test -p tauri-app` - Rust unit tests (SQLCipher bootstrap, telemetry buffer, vault helpers).
 
-> Tip: if you add new telemetry scenarios, keep JSONL lines small so the default 5 MiB rotation window isn’t tripped unintentionally.
+> Tip: if you add new telemetry scenarios, keep JSONL lines small so the default 5 MiB rotation window isn’t tripped unintentionally.
 
 ## Environment & Secrets
 
+- `.env.development` is checked in with safe placeholder values so the desktop shell boots with telemetry enabled and stub API keys. Copy it to `.env.local` for custom tweaks.
 - `.env` files are **only** loaded in debug/dev builds. Production binaries rely on real environment variables or the OS keychain. If you need `.env` during automated testing, opt-in via `ALLOW_DOTENV=1`.
 - Database keys live under the OS keychain service `GoogleMapsListComparator` and are never written to disk. Deleting/corrupting the entry automatically forces a secure rebootstrap on next launch.
 - Telemetry buffer defaults can be tuned with:
@@ -30,8 +32,15 @@ Run these from the repository root:
 
 ## Observability Aids
 
-- The UI “Runtime status” section shows the encrypted DB path, telemetry buffer path, queue depth, bootstrap recovery status, and redacted key lifecycle so QA can quickly confirm health.
+- The UI "Runtime status" section shows the encrypted DB path, telemetry buffer path, queue depth, bootstrap recovery status, and redacted key lifecycle so QA can quickly confirm health.
 - Telemetry events (`vault_audit`, `app_start`, etc.) drain to `telemetry-buffer.jsonl` and rotate to timestamped archives when full. JSONL makes it easy to `rg` or `jq` through the backlog while offline.
+- A front-end telemetry adapter (see `src/telemetry/adapter.ts`) funnels UI events through a Tauri command that reuses the Rust buffer. Events are automatically throttled and flushed so future instrumentation can stay in TypeScript.
+
+## Continuous Integration & Smoke Tests
+
+- `.github/workflows/ci.yml` runs on every push/PR: it installs dependencies with pnpm, executes the smoke harness, then builds an unsigned Windows NSIS installer on `windows-latest`.
+- The workflow uploads `src-tauri/target/release/bundle/nsis/*.exe` as an artifact named `tauri-windows-nsis`.
+- The same `pnpm smoke` harness is available locally and supports `SMOKE_SKIP_JS=1` or `SMOKE_SKIP_RUST=1` if you need to focus on a subset of checks.
 
 ## IDE / Tooling
 

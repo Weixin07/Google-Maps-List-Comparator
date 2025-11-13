@@ -11,7 +11,7 @@ use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use rusqlite::Connection as SqlConnection;
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::Manager;
 use tracing::warn;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -99,6 +99,19 @@ impl AppState {
         ))
     }
 
+    pub fn record_telemetry_event(
+        &self,
+        name: String,
+        payload: Value,
+        flush: bool,
+    ) -> AppResult<()> {
+        self.telemetry.record(name, payload)?;
+        if flush {
+            self.telemetry.flush()?;
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn _connection(&self) -> Arc<Mutex<SqlConnection>> {
         Arc::clone(&self.db)
@@ -128,7 +141,10 @@ pub fn run() {
             app.manage(state);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::foundation_health])
+        .invoke_handler(tauri::generate_handler![
+            commands::foundation_health,
+            commands::record_telemetry_event
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

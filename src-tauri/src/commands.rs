@@ -1,4 +1,5 @@
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::config::PublicAppConfig;
 use crate::AppState;
@@ -41,4 +42,16 @@ pub async fn foundation_health(
     state: tauri::State<'_, AppState>,
 ) -> Result<FoundationHealth, String> {
     state.foundation_health().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn record_telemetry_event(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    payload: Value,
+    flush: Option<bool>,
+) -> Result<(), String> {
+    state
+        .record_telemetry_event(name, payload, flush.unwrap_or(false))
+        .map_err(|err| err.to_string())
 }

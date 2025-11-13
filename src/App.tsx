@@ -2,8 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { FoundationHealth } from "./types/foundation";
 import "./App.css";
+import { telemetry } from "./telemetry";
+import type { ChecklistItem } from "./checklist";
+import { resolveChecklist } from "./checklist";
 
-const checklistTemplate = [
+const checklistTemplate: ChecklistItem[] = [
   {
     id: "shell",
     label: "Tauri shell scaffolding",
@@ -51,6 +54,14 @@ function App() {
   );
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const mode = import.meta.env.DEV ? "DEV MODE" : "PRODUCTION BUILD";
+  const isDevMode = import.meta.env.DEV;
+
+  useEffect(() => {
+    telemetry.track("ui_boot", { mode });
+    return () => {
+      void telemetry.flush();
+    };
+  }, [mode]);
 
   useEffect(() => {
     let mounted = true;
@@ -71,29 +82,38 @@ function App() {
     };
   }, []);
 
-  const checklist = useMemo(() => {
-    return checklistTemplate.map((item) => {
-      if (item.id === "sqlcipher") {
-        return {
-          ...item,
-          status: foundationHealth?.has_encryption_key ? "done" : item.status,
-        };
-      }
-      if (item.id === "telemetry") {
-        return {
-          ...item,
-          status: foundationHealth ? "done" : item.status,
-        };
-      }
-      if (item.id === "ci") {
-        return {
-          ...item,
-          status: import.meta.env.DEV ? "pending" : item.status,
-        };
-      }
-      return item;
-    });
+  useEffect(() => {
+    if (foundationHealth) {
+      telemetry.setEnabled(foundationHealth.config.telemetry_enabled_by_default);
+      telemetry.track(
+        "foundation_health_loaded",
+        {
+          queueDepth: foundationHealth.telemetry_queue_depth,
+          recovered: foundationHealth.db_bootstrap_recovered,
+        },
+        { flush: true },
+      );
+    }
   }, [foundationHealth]);
+
+  useEffect(() => {
+    if (bootstrapError) {
+      telemetry.track(
+        "foundation_bootstrap_failed",
+        { reason: bootstrapError },
+        { flush: true },
+      );
+    }
+  }, [bootstrapError]);
+
+  const checklist = useMemo(
+    () =>
+      resolveChecklist(checklistTemplate, {
+        foundationHealth,
+        isDevMode,
+      }),
+    [foundationHealth, isDevMode],
+  );
 
   return (
     <main className="app-shell">
