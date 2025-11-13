@@ -9,6 +9,8 @@ export type PublicAppConfig = {
   database_file_name: string;
   has_google_places_key: boolean;
   has_maptiler_key: boolean;
+  drive_import_enabled: boolean;
+  drive_picker_page_size: number;
 };
 
 export type FoundationHealth = {

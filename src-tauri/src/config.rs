@@ -6,6 +6,11 @@ use tracing::debug;
 
 const DEFAULT_TELEMETRY_BUFFER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_TELEMETRY_BUFFER_MAX_FILES: usize = 5;
+const DEFAULT_DEVICE_CODE_ENDPOINT: &str = "https://oauth2.googleapis.com/device/code";
+const DEFAULT_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+const DEFAULT_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const DEFAULT_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+const DEFAULT_DRIVE_PICKER_PAGE_SIZE: usize = 25;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -19,6 +24,13 @@ pub struct AppConfig {
     pub database_file_name: String,
     pub google_places_api_key: Option<SecretString>,
     pub maptiler_key: Option<SecretString>,
+    pub google_oauth_client_id: Option<String>,
+    pub google_oauth_client_secret: Option<String>,
+    pub google_device_code_endpoint: String,
+    pub google_token_endpoint: String,
+    pub google_userinfo_endpoint: String,
+    pub google_drive_api_base: String,
+    pub google_drive_picker_page_size: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -33,6 +45,8 @@ pub struct PublicAppConfig {
     pub database_file_name: String,
     pub has_google_places_key: bool,
     pub has_maptiler_key: bool,
+    pub drive_import_enabled: bool,
+    pub drive_picker_page_size: usize,
 }
 
 impl AppConfig {
@@ -63,6 +77,24 @@ impl AppConfig {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .map(|value| SecretString::new(value.into())),
+            google_oauth_client_id: env::var("GOOGLE_OAUTH_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            google_oauth_client_secret: env::var("GOOGLE_OAUTH_CLIENT_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            google_device_code_endpoint: env::var("GOOGLE_DEVICE_CODE_ENDPOINT")
+                .unwrap_or_else(|_| DEFAULT_DEVICE_CODE_ENDPOINT.to_string()),
+            google_token_endpoint: env::var("GOOGLE_TOKEN_ENDPOINT")
+                .unwrap_or_else(|_| DEFAULT_TOKEN_ENDPOINT.to_string()),
+            google_userinfo_endpoint: env::var("GOOGLE_USERINFO_ENDPOINT")
+                .unwrap_or_else(|_| DEFAULT_USERINFO_ENDPOINT.to_string()),
+            google_drive_api_base: env::var("GOOGLE_DRIVE_API_BASE")
+                .unwrap_or_else(|_| DEFAULT_DRIVE_API_BASE.to_string()),
+            google_drive_picker_page_size: parse_usize(
+                "GOOGLE_DRIVE_PICKER_PAGE_SIZE",
+                DEFAULT_DRIVE_PICKER_PAGE_SIZE,
+            ),
         }
     }
 
@@ -78,6 +110,9 @@ impl AppConfig {
             database_file_name: self.database_file_name.clone(),
             has_google_places_key: self.google_places_api_key.is_some(),
             has_maptiler_key: self.maptiler_key.is_some(),
+            drive_import_enabled: self.google_oauth_client_id.is_some()
+                && self.google_oauth_client_secret.is_some(),
+            drive_picker_page_size: self.google_drive_picker_page_size,
         }
     }
 }
@@ -138,6 +173,9 @@ mod tests {
         env::set_var("DATABASE_FILE_NAME", "custom.db");
         env::set_var("TELEMETRY_ENABLED", "false");
         env::set_var("TELEMETRY_BATCH_SIZE", "10");
+        env::set_var("GOOGLE_OAUTH_CLIENT_ID", "client");
+        env::set_var("GOOGLE_OAUTH_CLIENT_SECRET", "secret");
+        env::set_var("GOOGLE_DRIVE_PICKER_PAGE_SIZE", "5");
 
         let config = AppConfig::from_env();
         let public = config.public_profile();
@@ -147,6 +185,8 @@ mod tests {
         assert!(public.has_google_places_key);
         assert!(public.has_maptiler_key);
         assert!(config.google_places_api_key.is_some());
+        assert!(public.drive_import_enabled);
+        assert_eq!(public.drive_picker_page_size, 5);
         assert_eq!(
             public.telemetry_buffer_max_bytes,
             DEFAULT_TELEMETRY_BUFFER_MAX_BYTES

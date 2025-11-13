@@ -14,7 +14,8 @@
     "test": "vitest",
     "test:ci": "vitest run --coverage",
     "check": "pnpm typecheck && pnpm lint && pnpm test",
-    "smoke": "node ./scripts/smoke.mjs"
+    "smoke": "node ./scripts/smoke.mjs",
+    "qa:drive": "node ./scripts/mock-drive-server.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

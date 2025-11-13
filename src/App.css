@@ -229,6 +229,142 @@ body {
   font-weight: 600;
 }
 
+.drive-panel {
+  background-color: #ffffff;
+  padding: 2rem;
+  border-radius: 1.5rem;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
+}
+
+.drive-grid {
+  margin-top: 1rem;
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.identity-card,
+.file-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 1.25rem;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  background: #f8fafc;
+}
+
+.primary-button,
+.secondary-button,
+.link-button {
+  border: none;
+  border-radius: 0.75rem;
+  padding: 0.75rem 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.primary-button {
+  background-color: #0ea5e9;
+  color: #f8fafc;
+  box-shadow: 0 12px 24px rgba(14, 165, 233, 0.3);
+}
+
+.primary-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.secondary-button {
+  background-color: #e2e8f0;
+  color: #0f172a;
+}
+
+.link-button {
+  background: none;
+  color: #0ea5e9;
+  text-decoration: underline;
+  padding: 0;
+}
+
+.device-flow {
+  background-color: #0f172a;
+  color: #f8fafc;
+  padding: 1rem;
+  border-radius: 1rem;
+}
+
+.identity-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.muted {
+  color: #64748b;
+  margin: 0;
+}
+
+.list-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.list-card {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 1rem;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.list-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.list-card__count {
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.field-label {
+  font-size: 0.85rem;
+  color: #475569;
+}
+
+.list-card select {
+  border-radius: 0.75rem;
+  border: 1px solid #cbd5f5;
+  padding: 0.6rem;
+  font-size: 0.95rem;
+}
+
+.progress-track {
+  width: 100%;
+  height: 0.4rem;
+  border-radius: 999px;
+  background-color: #e2e8f0;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #0ea5e9, #0369a1);
+  transition: width 0.2s ease;
+}
+
+.progress-copy {
+  margin: 0;
+  color: #475569;
+  font-size: 0.85rem;
+}
+
 @media (max-width: 600px) {
   .app-shell {
     padding: 2rem 1.25rem;

@@ -202,6 +202,9 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
             place_id TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
         );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lists_name ON lists(name);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_items_list_hash ON raw_items(list_id, source_row_hash);
         "#,
     )?;
     Ok(())

@@ -1,11 +1,8 @@
-#[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
-#[cfg(test)]
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -67,7 +64,6 @@ impl SecretMaterial {
 #[derive(Clone)]
 enum SecretBackend {
     Keyring,
-    #[cfg(test)]
     Memory(Arc<Mutex<HashMap<String, SecretString>>>),
 }
 
@@ -79,7 +75,6 @@ impl SecretVault {
         }
     }
 
-    #[cfg(test)]
     pub fn in_memory() -> Self {
         Self {
             service_name: "in-memory".to_string(),
@@ -130,7 +125,6 @@ impl SecretVault {
                     Err(err) => Err(AppError::from(err)),
                 }
             }
-            #[cfg(test)]
             SecretBackend::Memory(store) => {
                 store.lock().remove(account);
                 Ok(())
@@ -140,6 +134,14 @@ impl SecretVault {
 
     pub fn has(&self, account: &str) -> AppResult<bool> {
         self.try_get(account).map(|secret| secret.is_some())
+    }
+
+    pub fn read_secret(&self, account: &str) -> AppResult<Option<SecretString>> {
+        self.try_get(account)
+    }
+
+    pub fn write_secret(&self, account: &str, secret: &SecretString) -> AppResult<()> {
+        self.store(account, secret)
     }
 
     fn try_get(&self, account: &str) -> AppResult<Option<SecretString>> {
@@ -152,7 +154,6 @@ impl SecretVault {
                     Err(err) => Err(AppError::from(err)),
                 }
             }
-            #[cfg(test)]
             SecretBackend::Memory(store) => Ok(store.lock().get(account).cloned()),
         }
     }
@@ -164,7 +165,6 @@ impl SecretVault {
                 entry.set_password(secret.expose_secret())?;
                 Ok(())
             }
-            #[cfg(test)]
             SecretBackend::Memory(store) => {
                 store.lock().insert(account.to_string(), secret.clone());
                 Ok(())

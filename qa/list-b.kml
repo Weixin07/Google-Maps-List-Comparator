@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Placemark>
+      <name>QA Pizza</name>
+      <Point>
+        <coordinates>-73.9851,40.758,0</coordinates>
+      </Point>
+    </Placemark>
+    <Placemark>
+      <name>QA Dessert</name>
+      <description>Late-night gelato</description>
+      <Point>
+        <coordinates>-73.987,40.761,0</coordinates>
+      </Point>
+      <ExtendedData>
+        <Data name="PlaceID">
+          <value>ChIJyWEHuEmuEmsRm9hTkapTCrk</value>
+        </Data>
+      </ExtendedData>
+    </Placemark>
+  </Document>
+</kml>

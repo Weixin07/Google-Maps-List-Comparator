@@ -298,6 +298,13 @@ mod tests {
             database_file_name: "test.db".into(),
             google_places_api_key: None,
             maptiler_key: None,
+            google_oauth_client_id: None,
+            google_oauth_client_secret: None,
+            google_device_code_endpoint: "https://oauth2.googleapis.com/device/code".into(),
+            google_token_endpoint: "https://oauth2.googleapis.com/token".into(),
+            google_userinfo_endpoint: "https://openidconnect.googleapis.com/v1/userinfo".into(),
+            google_drive_api_base: "https://www.googleapis.com/drive/v3".into(),
+            google_drive_picker_page_size: 25,
         };
 
         let client = TelemetryClient::new(dir.path(), &config).unwrap();
@@ -405,6 +412,13 @@ mod tests {
             database_file_name: "test.db".into(),
             google_places_api_key: None,
             maptiler_key: None,
+            google_oauth_client_id: None,
+            google_oauth_client_secret: None,
+            google_device_code_endpoint: "https://oauth2.googleapis.com/device/code".into(),
+            google_token_endpoint: "https://oauth2.googleapis.com/token".into(),
+            google_userinfo_endpoint: "https://openidconnect.googleapis.com/v1/userinfo".into(),
+            google_drive_api_base: "https://www.googleapis.com/drive/v3".into(),
+            google_drive_picker_page_size: 25,
         }
     }
 }

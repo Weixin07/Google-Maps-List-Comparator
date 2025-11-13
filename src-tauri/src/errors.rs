@@ -16,8 +16,12 @@ pub enum AppError {
     Keychain(#[from] keyring::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
     #[error("{0}")]
     Config(String),
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
+    #[error("parse error: {0}")]
+    Parse(String),
 }

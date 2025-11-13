@@ -2,6 +2,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::PublicAppConfig;
+use crate::google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity};
+use crate::ingestion::{ImportSummary, ListSlot};
 use crate::AppState;
 
 #[derive(Debug, Serialize)]
@@ -53,5 +55,52 @@ pub async fn record_telemetry_event(
 ) -> Result<(), String> {
     state
         .record_telemetry_event(name, payload, flush.unwrap_or(false))
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn google_start_device_flow(
+    state: tauri::State<'_, AppState>,
+) -> Result<DeviceFlowState, String> {
+    state
+        .start_device_flow()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn google_complete_sign_in(
+    state: tauri::State<'_, AppState>,
+    device_code: String,
+    interval_secs: Option<u64>,
+) -> Result<GoogleIdentity, String> {
+    state
+        .complete_device_flow(device_code, interval_secs.unwrap_or(5))
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn drive_list_kml_files(
+    state: tauri::State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<DriveFileMetadata>, String> {
+    state
+        .list_drive_files(limit)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn drive_import_kml(
+    state: tauri::State<'_, AppState>,
+    slot: String,
+    file_id: String,
+    file_name: String,
+) -> Result<ImportSummary, String> {
+    let parsed_slot = ListSlot::parse(&slot).map_err(|err| err.to_string())?;
+    state
+        .import_drive_file(parsed_slot, file_id, file_name)
+        .await
         .map_err(|err| err.to_string())
 }
