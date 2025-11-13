@@ -3,8 +3,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rusqlcipher::ffi::ErrorCode;
-use rusqlcipher::{Connection, Error as SqlcipherError, OpenFlags};
+use rusqlite::ffi::ErrorCode;
+use rusqlite::{Connection, Error as SqliteError, OpenFlags};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, warn};
 
@@ -72,11 +72,29 @@ pub fn bootstrap<P: AsRef<Path>>(
 }
 
 fn establish_context(db_path: &Path, passphrase: &SecretString) -> AppResult<DatabaseContext> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
-    let connection =
-        Connection::open_with_flags_and_key(db_path, flags, passphrase.expose_secret())?;
+    match establish_context_with_mode(db_path, passphrase, true) {
+        Ok(context) => Ok(context),
+        Err(err) if is_memory_security_error(&err) => {
+            warn!(
+                target: "database_bootstrap",
+                path = %db_path.display(),
+                "cipher_memory_security unsupported; continuing without locked pages"
+            );
+            establish_context_with_mode(db_path, passphrase, false)
+        }
+        Err(err) => Err(err),
+    }
+}
 
-    configure_cipher(&connection)?;
+fn establish_context_with_mode(
+    db_path: &Path,
+    passphrase: &SecretString,
+    enforce_memory_security: bool,
+) -> AppResult<DatabaseContext> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+    let connection = Connection::open_with_flags(db_path, flags)?;
+    apply_pragmas(&connection, passphrase)?;
+    configure_cipher(&connection, enforce_memory_security)?;
     run_migrations(&connection)?;
     assert_encrypted(db_path)?;
 
@@ -86,19 +104,59 @@ fn establish_context(db_path: &Path, passphrase: &SecretString) -> AppResult<Dat
     })
 }
 
-fn configure_cipher(connection: &Connection) -> AppResult<()> {
+fn apply_pragmas(connection: &Connection, passphrase: &SecretString) -> AppResult<()> {
+    connection
+        .pragma_update(None, "cipher_default_page_size", 4096_i64)
+        .map_err(AppError::from)?;
+    connection
+        .pragma_update(None, "cipher_default_kdf_iter", 64000_i64)
+        .map_err(AppError::from)?;
+    connection
+        .pragma_update(None, "cipher_default_hmac_algorithm", "HMAC_SHA512")
+        .map_err(AppError::from)?;
+    connection
+        .pragma_update(None, "cipher_default_kdf_algorithm", "PBKDF2_HMAC_SHA512")
+        .map_err(AppError::from)?;
+    connection
+        .pragma_update(None, "key", passphrase.expose_secret())
+        .map_err(AppError::from)
+}
+
+fn configure_cipher(connection: &Connection, enforce_memory_security: bool) -> AppResult<()> {
     connection.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
-        PRAGMA cipher_page_size = 4096;
-        PRAGMA kdf_iter = 64000;
-        PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
-        PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
-        PRAGMA cipher_memory_security = ON;
         "#,
     )?;
+    if enforce_memory_security {
+        enable_cipher_memory_security(connection)?;
+    }
     Ok(())
+}
+
+fn enable_cipher_memory_security(connection: &Connection) -> AppResult<()> {
+    match connection.execute("PRAGMA cipher_memory_security = ON;", []) {
+        Ok(_) => Ok(()),
+        Err(SqliteError::SqliteFailure(error, _)) if error.code == ErrorCode::OutOfMemory => {
+            warn!(
+                target: "database_bootstrap",
+                error = ?error,
+                "cipher_memory_security not enabled; continuing without locked pages support"
+            );
+            Ok(())
+        }
+        Err(err) => Err(AppError::from(err)),
+    }
+}
+
+fn is_memory_security_error(err: &AppError) -> bool {
+    match err {
+        AppError::Database(SqliteError::SqliteFailure(code, _)) => {
+            code.code == ErrorCode::OutOfMemory
+        }
+        _ => false,
+    }
 }
 
 fn run_migrations(connection: &Connection) -> AppResult<()> {
@@ -168,18 +226,22 @@ fn assert_encrypted(db_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn should_attempt_recovery(err: &SqlcipherError, db_path: &Path) -> bool {
+fn should_attempt_recovery(err: &SqliteError, db_path: &Path) -> bool {
     if !db_path.exists() {
         return false;
     }
 
     match err {
-        SqlcipherError::SqliteFailure(code, message) => {
-            matches!(code.code, ErrorCode::NotADatabase | ErrorCode::IoErr)
-                || message
-                    .as_deref()
-                    .map(|msg| msg.contains("encrypted") || msg.contains("database disk image is malformed"))
-                    .unwrap_or(false)
+        SqliteError::SqliteFailure(code, message) => {
+            matches!(
+                code.code,
+                ErrorCode::NotADatabase | ErrorCode::SystemIoFailure
+            ) || message
+                .as_deref()
+                .map(|msg| {
+                    msg.contains("encrypted") || msg.contains("database disk image is malformed")
+                })
+                .unwrap_or(false)
         }
         _ => false,
     }
@@ -214,6 +276,7 @@ fn shm_path(db_path: &Path) -> PathBuf {
     buf
 }
 
+#[allow(dead_code)]
 pub fn now_timestamp() -> String {
     Utc::now().to_rfc3339()
 }

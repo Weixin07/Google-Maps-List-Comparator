@@ -1,8 +1,11 @@
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
+#[cfg(test)]
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -51,6 +54,7 @@ impl SecretMaterial {
         &self.secret
     }
 
+    #[allow(dead_code)]
     pub fn into_secret(self) -> SecretString {
         self.secret
     }
@@ -116,6 +120,7 @@ impl SecretVault {
         Ok(SecretMaterial::new(secret, SecretLifecycle::Rotated))
     }
 
+    #[allow(dead_code)]
     pub fn delete(&self, account: &str) -> AppResult<()> {
         match &self.backend {
             SecretBackend::Keyring => {
@@ -142,7 +147,7 @@ impl SecretVault {
             SecretBackend::Keyring => {
                 let entry = keyring::Entry::new(&self.service_name, account)?;
                 match entry.get_password() {
-                    Ok(value) => Ok(Some(SecretString::new(value))),
+                    Ok(value) => Ok(Some(SecretString::new(value.into()))),
                     Err(keyring::Error::NoEntry) => Ok(None),
                     Err(err) => Err(AppError::from(err)),
                 }
@@ -171,7 +176,7 @@ impl SecretVault {
         let mut bytes = vec![0_u8; KEY_LENGTH];
         OsRng.fill_bytes(&mut bytes);
         let encoded = STANDARD_NO_PAD.encode(bytes);
-        SecretString::new(encoded)
+        SecretString::new(encoded.into())
     }
 }
 

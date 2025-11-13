@@ -11,7 +11,7 @@ pub enum AppError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
-    Database(#[from] rusqlcipher::Error),
+    Database(#[from] rusqlite::Error),
     #[error(transparent)]
     Keychain(#[from] keyring::Error),
     #[error(transparent)]
@@ -20,10 +20,4 @@ pub enum AppError {
     Config(String),
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
-}
-
-impl From<tauri::path::Error> for AppError {
-    fn from(value: tauri::path::Error) -> Self {
-        AppError::Path(value.to_string())
-    }
 }

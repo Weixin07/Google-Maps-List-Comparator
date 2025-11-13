@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,7 +8,12 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 
+#[cfg(test)]
+use std::io;
+
 use crate::config::AppConfig;
+#[cfg(test)]
+use crate::errors::AppError;
 use crate::errors::AppResult;
 
 #[derive(Clone)]
@@ -73,6 +78,7 @@ impl TelemetryClient {
         &self.buffer_path
     }
 
+    #[allow(dead_code)]
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
@@ -179,7 +185,10 @@ impl TelemetryClient {
                     let name = dir_entry.file_name();
                     let name = name.to_string_lossy();
                     if name.starts_with(&prefix) && name.ends_with(".jsonl") {
-                        Some((dir_entry.path(), dir_entry.metadata().ok()?.modified().ok()?))
+                        Some((
+                            dir_entry.path(),
+                            dir_entry.metadata().ok()?.modified().ok()?,
+                        ))
                     } else {
                         None
                     }
@@ -190,7 +199,8 @@ impl TelemetryClient {
         rotations.sort_by_key(|(_, modified)| *modified);
         let allowed = self.max_file_count.saturating_sub(1);
         if rotations.len() > allowed {
-            for (path, _) in rotations.into_iter().take(rotations.len() - allowed) {
+            let excess = rotations.len() - allowed;
+            for (path, _) in rotations.into_iter().take(excess) {
                 let _ = fs::remove_file(path);
             }
         }
@@ -282,8 +292,8 @@ mod tests {
             telemetry_enabled_by_default: true,
             telemetry_flush_interval_ms: 1000,
             telemetry_batch_size: 1,
-             telemetry_buffer_max_bytes: 1024,
-             telemetry_buffer_max_files: 3,
+            telemetry_buffer_max_bytes: 1024,
+            telemetry_buffer_max_files: 3,
             places_rate_limit_qps: 3,
             database_file_name: "test.db".into(),
             google_places_api_key: None,
@@ -357,7 +367,9 @@ mod tests {
     #[test]
     fn recovers_from_disk_full_error() {
         let dir = tempdir().unwrap();
-        let mut client = TelemetryClient::new(dir.path(), &test_config()).unwrap();
+        let mut config = test_config();
+        config.telemetry_batch_size = 1;
+        let mut client = TelemetryClient::new(dir.path(), &config).unwrap();
         let hooks = client.enable_test_hooks();
         hooks.fail_next_disk_full();
 

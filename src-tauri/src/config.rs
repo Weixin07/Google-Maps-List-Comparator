@@ -58,11 +58,11 @@ impl AppConfig {
             google_places_api_key: env::var("GOOGLE_PLACES_API_KEY")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-                .map(SecretString::new),
+                .map(|value| SecretString::new(value.into())),
             maptiler_key: env::var("MAPTILER_API_KEY")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-                .map(SecretString::new),
+                .map(|value| SecretString::new(value.into())),
         }
     }
 

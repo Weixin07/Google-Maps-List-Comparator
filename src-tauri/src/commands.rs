@@ -1,7 +1,6 @@
 use serde::Serialize;
 
 use crate::config::PublicAppConfig;
-use crate::errors::AppResult;
 use crate::AppState;
 
 #[derive(Debug, Serialize)]

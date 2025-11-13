@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
+use rusqlite::Connection as SqlConnection;
 use serde_json::json;
 use tauri::Manager;
 use tracing::warn;
@@ -17,8 +18,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::commands::FoundationHealth;
 use crate::config::AppConfig;
-use crate::db::{bootstrap, DatabaseBootstrap, DB_KEY_ALIAS};
-use crate::errors::{AppError, AppResult};
+use crate::db::{bootstrap, DatabaseBootstrap, DatabaseContext, DB_KEY_ALIAS};
+use crate::errors::AppResult;
 use crate::secrets::{SecretLifecycle, SecretVault};
 use crate::telemetry::TelemetryClient;
 
@@ -27,7 +28,7 @@ const VAULT_SERVICE_NAME: &str = "GoogleMapsListComparator";
 pub use commands::foundation_health;
 
 pub struct AppState {
-    db: Arc<Mutex<rusqlcipher::Connection>>,
+    db: Arc<Mutex<SqlConnection>>,
     db_path: PathBuf,
     vault: SecretVault,
     config: AppConfig,
@@ -41,10 +42,7 @@ impl AppState {
         init_tracing();
         let config = AppConfig::from_env();
         let vault = SecretVault::new(VAULT_SERVICE_NAME);
-        let data_dir = app
-            .path()
-            .app_data_dir()?
-            .ok_or_else(|| AppError::Path("app data directory unavailable".into()))?;
+        let data_dir = app.path().app_data_dir()?;
 
         std::fs::create_dir_all(&data_dir)?;
         let DatabaseBootstrap {
@@ -102,7 +100,7 @@ impl AppState {
     }
 
     #[allow(dead_code)]
-    pub fn _connection(&self) -> Arc<Mutex<rusqlcipher::Connection>> {
+    pub fn _connection(&self) -> Arc<Mutex<SqlConnection>> {
         Arc::clone(&self.db)
     }
 }
@@ -124,7 +122,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let state = AppState::initialize(app)
+            let handle = app.handle();
+            let state = AppState::initialize(&handle)
                 .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
             app.manage(state);
             Ok(())
