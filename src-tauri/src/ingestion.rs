@@ -99,6 +99,7 @@ pub fn parse_kml(bytes: &[u8]) -> AppResult<Vec<NormalizedRow>> {
 
 pub fn persist_rows(
     connection: &mut Connection,
+    project_id: i64,
     slot: ListSlot,
     drive_file_id: &str,
     rows: &[NormalizedRow],
@@ -107,8 +108,8 @@ pub fn persist_rows(
     let list_name = slot.display_name();
     let existing: Option<i64> = tx
         .query_row(
-            "SELECT id FROM lists WHERE name = ?1 LIMIT 1",
-            [list_name],
+            "SELECT id FROM lists WHERE project_id = ?1 AND slot = ?2 LIMIT 1",
+            (project_id, slot.as_tag()),
             |row| row.get(0),
         )
         .optional()?;
@@ -116,15 +117,20 @@ pub fn persist_rows(
     let list_id = match existing {
         Some(id) => {
             tx.execute(
-                "UPDATE lists SET drive_file_id = ?1, imported_at = DATETIME('now') WHERE id = ?2",
-                (drive_file_id, id),
+                "UPDATE lists
+                SET drive_file_id = ?1,
+                    imported_at = DATETIME('now'),
+                    name = ?3
+                WHERE id = ?2",
+                (drive_file_id, id, list_name),
             )?;
             id
         }
         None => {
             tx.execute(
-                "INSERT INTO lists (name, source, drive_file_id) VALUES (?1, 'drive_kml', ?2)",
-                (list_name, drive_file_id),
+                "INSERT INTO lists (project_id, slot, name, source, drive_file_id)
+                VALUES (?1, ?2, ?3, 'drive_kml', ?4)",
+                (project_id, slot.as_tag(), list_name, drive_file_id),
             )?;
             tx.last_insert_rowid()
         }
@@ -302,7 +308,15 @@ mod tests {
         let telemetry = TelemetryClient::new(dir.path(), &crate::config::AppConfig::from_env())
             .expect("telemetry");
         let rows = parse_kml(SAMPLE_KML.as_bytes()).unwrap();
-        let summary = persist_rows(&mut conn, ListSlot::A, "drive-file", &rows).unwrap();
+        let project_id: i64 = conn
+            .query_row(
+                "SELECT id FROM comparison_projects WHERE is_active = 1 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let summary =
+            persist_rows(&mut conn, project_id, ListSlot::A, "drive-file", &rows).unwrap();
         assert_eq!(summary.row_count, 2);
         enqueue_place_hashes(&telemetry, ListSlot::A, &rows).unwrap();
 

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::ffi::ErrorCode;
-use rusqlite::{Connection, Error as SqliteError, OpenFlags};
+use rusqlite::{Connection, Error as SqliteError, OpenFlags, OptionalExtension};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, warn};
 
@@ -162,6 +162,15 @@ fn is_memory_security_error(err: &AppError) -> bool {
 fn run_migrations(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS comparison_projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            slug TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+            updated_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+            is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1))
+        );
+
         CREATE TABLE IF NOT EXISTS lists (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -183,6 +192,7 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS list_places (
             list_id INTEGER NOT NULL,
             place_id TEXT NOT NULL,
+            assigned_at TEXT NOT NULL DEFAULT (DATETIME('now')),
             PRIMARY KEY (list_id, place_id),
             FOREIGN KEY (list_id) REFERENCES lists(id) ON DELETE CASCADE,
             FOREIGN KEY (place_id) REFERENCES places(place_id) ON DELETE CASCADE
@@ -203,11 +213,58 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
             created_at TEXT NOT NULL DEFAULT (DATETIME('now'))
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_lists_name ON lists(name);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_items_list_hash ON raw_items(list_id, source_row_hash);
         "#,
     )?;
+
+    ensure_column(
+        connection,
+        "list_places",
+        "assigned_at TEXT NOT NULL DEFAULT (DATETIME('now'))",
+    )?;
+    ensure_column(connection, "lists", "project_id INTEGER REFERENCES comparison_projects(id)")?;
+    ensure_column(
+        connection,
+        "lists",
+        "slot TEXT NOT NULL DEFAULT 'A'",
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_places_lat_lng ON places(lat, lng)",
+        [],
+    )?;
+    connection.execute("DROP INDEX IF EXISTS idx_lists_name", [])?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_lists_project_slot ON lists(project_id, slot)",
+        [],
+    )?;
+    seed_default_project(connection)?;
     Ok(())
+}
+
+fn ensure_column(connection: &Connection, table: &str, definition: &str) -> AppResult<()> {
+    let column_name = definition
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| AppError::Config(format!("invalid column definition: {definition}")))?;
+    if column_exists(connection, table, column_name)? {
+        return Ok(());
+    }
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {definition}");
+    connection.execute(&sql, [])?;
+    Ok(())
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = connection.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn assert_encrypted(db_path: &Path) -> AppResult<()> {
@@ -282,6 +339,56 @@ fn shm_path(db_path: &Path) -> PathBuf {
 #[allow(dead_code)]
 pub fn now_timestamp() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn seed_default_project(connection: &Connection) -> AppResult<()> {
+    connection.execute(
+        "INSERT INTO comparison_projects (name, slug, is_active)
+        SELECT 'Default project', 'default-project', 1
+        WHERE NOT EXISTS (SELECT 1 FROM comparison_projects)",
+        [],
+    )?;
+
+    let active_id = match connection
+        .query_row(
+            "SELECT id FROM comparison_projects WHERE is_active = 1 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        Some(id) => id,
+        None => {
+            let fallback: i64 = connection.query_row(
+                "SELECT id FROM comparison_projects ORDER BY id ASC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "UPDATE comparison_projects SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
+                [fallback],
+            )?;
+            fallback
+        }
+    };
+
+    connection.execute(
+        "UPDATE lists SET project_id = ?1 WHERE project_id IS NULL",
+        [active_id],
+    )?;
+
+    connection.execute(
+        "UPDATE lists SET slot = 'B'
+        WHERE slot = 'A' AND LOWER(name) LIKE '%b%'",
+        [],
+    )?;
+
+    connection.execute(
+        "UPDATE lists SET slot = UPPER(slot) WHERE slot NOT IN ('A','B')",
+        [],
+    )?;
+
+    Ok(())
 }
 
 #[cfg(test)]

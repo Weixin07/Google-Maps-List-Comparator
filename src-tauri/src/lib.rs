@@ -1,15 +1,21 @@
 mod commands;
+mod comparison;
 mod config;
 mod db;
 mod errors;
 mod google;
 mod ingestion;
+mod projects;
+mod places;
 mod secrets;
 mod telemetry;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use csv::WriterBuilder;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use once_cell::sync::OnceCell;
@@ -23,8 +29,12 @@ use tracing::warn;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::commands::FoundationHealth;
+use crate::comparison::{ComparisonSegment, ComparisonSnapshot, PlaceComparisonRow};
 use crate::db::{DatabaseBootstrap, DatabaseContext, DB_KEY_ALIAS};
 use crate::errors::{AppError, AppResult};
+use crate::places::{NormalizationStats, PlaceNormalizer};
+use secrecy::ExposeSecret;
+use crate::projects::ComparisonProjectRecord;
 use crate::secrets::SecretLifecycle;
 
 const VAULT_SERVICE_NAME: &str = "GoogleMapsListComparator";
@@ -77,9 +87,24 @@ impl ImportProgressPayload {
     }
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct MapStyleDescriptor {
+    pub style_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ExportSummary {
+    pub path: String,
+    pub rows: usize,
+    pub selected: usize,
+    pub format: String,
+    pub segment: String,
+}
+
 pub struct AppState {
     handle: tauri::AppHandle,
     db: Arc<Mutex<SqlConnection>>,
+    active_project_id: Arc<Mutex<i64>>,
     db_path: PathBuf,
     vault: SecretVault,
     config: AppConfig,
@@ -87,6 +112,7 @@ pub struct AppState {
     db_bootstrap_recovered: bool,
     db_key_lifecycle: SecretLifecycle,
     google: Option<GoogleServices>,
+    places: PlaceNormalizer,
 }
 
 impl AppState {
@@ -129,9 +155,18 @@ impl AppState {
             warn!(?err, "failed to flush telemetry queue");
         }
 
+        let db = Arc::new(Mutex::new(connection));
+        let initial_project_id = {
+            let conn = db.lock();
+            projects::active_project_id(&conn)?
+        };
+        let active_project_id = Arc::new(Mutex::new(initial_project_id));
+        let places = PlaceNormalizer::new(Arc::clone(&db), &config);
+
         Ok(Self {
             handle,
-            db: Arc::new(Mutex::new(connection)),
+            db,
+            active_project_id,
             db_path: path,
             vault,
             config,
@@ -139,6 +174,7 @@ impl AppState {
             db_bootstrap_recovered: recovered,
             db_key_lifecycle: key_lifecycle,
             google,
+            places,
         })
     }
 
@@ -153,6 +189,55 @@ impl AppState {
             self.db_bootstrap_recovered,
             self.db_key_lifecycle.as_str().to_string(),
         ))
+    }
+
+    pub fn map_style_descriptor(&self) -> MapStyleDescriptor {
+        let style_url = self.config.maptiler_key.as_ref().map(|key| {
+            format!(
+                "https://api.maptiler.com/maps/streets/style.json?key={}",
+                key.expose_secret()
+            )
+        });
+        MapStyleDescriptor { style_url }
+    }
+
+    pub fn list_comparison_projects(&self) -> AppResult<Vec<ComparisonProjectRecord>> {
+        let conn = self.db.lock();
+        projects::list_projects(&conn)
+    }
+
+    pub fn create_comparison_project(
+        &self,
+        name: String,
+        activate: bool,
+    ) -> AppResult<ComparisonProjectRecord> {
+        let record = {
+            let conn = self.db.lock();
+            projects::create_project(&conn, &name, activate)?
+        };
+        if record.is_active {
+            *self.active_project_id.lock() = record.id;
+        }
+        Ok(record)
+    }
+
+    pub fn set_active_comparison_project(
+        &self,
+        project_id: i64,
+    ) -> AppResult<ComparisonProjectRecord> {
+        let record = {
+            let conn = self.db.lock();
+            projects::set_active_project(&conn, project_id)?;
+            projects::project_by_id(&conn, project_id)?
+        };
+        *self.active_project_id.lock() = project_id;
+        Ok(record)
+    }
+
+    pub fn active_comparison_project(&self) -> AppResult<ComparisonProjectRecord> {
+        let project_id = *self.active_project_id.lock();
+        let conn = self.db.lock();
+        projects::project_by_id(&conn, project_id)
     }
 
     pub fn record_telemetry_event(
@@ -170,6 +255,74 @@ impl AppState {
 
     pub async fn start_device_flow(&self) -> AppResult<DeviceFlowState> {
         self.google()?.start_device_flow().await
+    }
+
+    pub fn comparison_snapshot(
+        &self,
+        project_id: Option<i64>,
+    ) -> AppResult<ComparisonSnapshot> {
+        let resolved = self.resolve_project_id(project_id)?;
+        let conn = self.db.lock();
+        comparison::compute_snapshot(&conn, resolved)
+    }
+
+    pub fn export_comparison_segment(
+        &self,
+        project_id: Option<i64>,
+        segment: ComparisonSegment,
+        format: &str,
+        selection: Option<Vec<String>>,
+        destination: PathBuf,
+    ) -> AppResult<ExportSummary> {
+        let resolved = self.resolve_project_id(project_id)?;
+        let snapshot = {
+            let conn = self.db.lock();
+            comparison::compute_snapshot(&conn, resolved)?
+        };
+        let target_rows = snapshot.rows_for_segment(segment);
+        let selection_set = selection.map(|ids| ids.into_iter().collect::<HashSet<_>>());
+        let filtered: Vec<&PlaceComparisonRow> = target_rows
+            .iter()
+            .filter(|row| {
+                selection_set
+                    .as_ref()
+                    .map_or(true, |set| set.contains(&row.place_id))
+            })
+            .collect();
+        let selected_count = selection_set.as_ref().map_or(0, |set| set.len());
+
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let export_format = ExportFormat::parse(format)?;
+        match export_format {
+            ExportFormat::Csv => export_csv(&destination, &filtered)?,
+            ExportFormat::Json => export_json(&destination, &filtered)?,
+        }
+
+        if let Err(err) = self.telemetry.record(
+            "export_generated",
+            json!({
+                "project_id": resolved,
+                "segment": segment.as_str(),
+                "format": export_format.as_str(),
+                "rows": filtered.len(),
+                "selected": selected_count,
+            }),
+        ) {
+            warn!(?err, "failed to record export_generated telemetry");
+        }
+
+        Ok(ExportSummary {
+            path: destination.to_string_lossy().to_string(),
+            rows: filtered.len(),
+            selected: selected_count.min(filtered.len()),
+            format: export_format.as_str().to_string(),
+            segment: segment.as_str().to_string(),
+        })
     }
 
     pub async fn complete_device_flow(
@@ -213,12 +366,14 @@ impl AppState {
 
     pub async fn import_drive_file(
         &self,
+        project_id: Option<i64>,
         slot: ListSlot,
         file_id: String,
         file_name: String,
     ) -> AppResult<ImportSummary> {
+        let resolved_project = self.resolve_project_id(project_id)?;
         match self
-            .import_drive_file_inner(slot, file_id, file_name.clone())
+            .import_drive_file_inner(resolved_project, slot, file_id, file_name.clone())
             .await
         {
             Ok(summary) => Ok(summary),
@@ -244,8 +399,19 @@ impl AppState {
         Arc::clone(&self.db)
     }
 
+    pub async fn refresh_place_details(
+        &self,
+        project_id: Option<i64>,
+        slots: Option<Vec<ListSlot>>,
+    ) -> AppResult<Vec<NormalizationStats>> {
+        let resolved_project = self.resolve_project_id(project_id)?;
+        let targets = slots.unwrap_or_else(|| vec![ListSlot::A, ListSlot::B]);
+        self.places.refresh_slots(resolved_project, &targets).await
+    }
+
     async fn import_drive_file_inner(
         &self,
+        project_id: i64,
         slot: ListSlot,
         file_id: String,
         file_name: String,
@@ -321,10 +487,20 @@ impl AppState {
 
         let summary = {
             let mut conn = self.db.lock();
-            persist_rows(&mut conn, slot, &file_id, &rows)?
+            persist_rows(&mut conn, project_id, slot, &file_id, &rows)?
         };
 
         enqueue_place_hashes(&self.telemetry, slot, &rows)?;
+
+        self.notify_progress(ImportProgressPayload::new(
+            slot,
+            "normalize",
+            "Reconciling Places details",
+            0.92,
+            Some(file_name.clone()),
+        ));
+
+        let normalization = self.places.normalize_slot(project_id, slot).await?;
 
         self.notify_progress(ImportProgressPayload::new(
             slot,
@@ -340,6 +516,10 @@ impl AppState {
                 "slot": slot.as_tag(),
                 "file_hash": file_hash,
                 "rows": rows.len(),
+                "normalized_rows": normalization.resolved,
+                "cache_hits": normalization.cache_hits,
+                "places_calls": normalization.places_calls,
+                "pending": normalization.unresolved,
             }),
         ) {
             warn!(?err, "failed to record import_completed telemetry");
@@ -351,6 +531,95 @@ impl AppState {
     fn notify_progress(&self, payload: ImportProgressPayload) {
         if let Err(err) = self.handle.emit("import://progress", payload) {
             warn!(?err, "failed to emit import progress");
+        }
+    }
+
+    fn resolve_project_id(&self, project_id: Option<i64>) -> AppResult<i64> {
+        if let Some(candidate) = project_id {
+            {
+                let conn = self.db.lock();
+                projects::project_by_id(&conn, candidate)?;
+            }
+            Ok(candidate)
+        } else {
+            Ok(*self.active_project_id.lock())
+        }
+    }
+}
+
+fn export_csv(path: &Path, rows: &[&PlaceComparisonRow]) -> AppResult<()> {
+    let mut writer = WriterBuilder::new().from_path(path)?;
+    writer.write_record([
+        "place_id",
+        "name",
+        "formatted_address",
+        "lat",
+        "lng",
+        "types",
+        "lists",
+    ])?;
+    for row in rows {
+        let lat = row.lat.to_string();
+        let lng = row.lng.to_string();
+        let types_joined = row.types.join("|");
+        let lists_joined = row
+            .lists
+            .iter()
+            .map(|slot| slot.as_tag())
+            .collect::<Vec<_>>()
+            .join("|");
+        writer.write_record([
+            row.place_id.as_str(),
+            row.name.as_str(),
+            row.formatted_address.as_deref().unwrap_or(""),
+            lat.as_str(),
+            lng.as_str(),
+            types_joined.as_str(),
+            lists_joined.as_str(),
+        ])?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn export_json(path: &Path, rows: &[&PlaceComparisonRow]) -> AppResult<()> {
+    let payload: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "place_id": row.place_id,
+                "name": row.name,
+                "formatted_address": row.formatted_address,
+                "lat": row.lat,
+                "lng": row.lng,
+                "types": row.types,
+                "lists": row.lists.iter().map(|slot| slot.as_tag()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let serialized = serde_json::to_vec_pretty(&payload)?;
+    fs::write(path, serialized)?;
+    Ok(())
+}
+
+enum ExportFormat {
+    Csv,
+    Json,
+}
+
+impl ExportFormat {
+    fn parse(value: &str) -> AppResult<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "csv" => Ok(Self::Csv),
+            "json" => Ok(Self::Json),
+            other => Err(AppError::Config(format!("unsupported export format: {other}"))),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
         }
     }
 }
@@ -390,7 +659,14 @@ pub fn run() {
             commands::google_start_device_flow,
             commands::google_complete_sign_in,
             commands::drive_list_kml_files,
-            commands::drive_import_kml
+            commands::drive_import_kml,
+            commands::refresh_place_details,
+            commands::compare_lists,
+            commands::list_comparison_projects,
+            commands::create_comparison_project,
+            commands::set_active_comparison_project,
+            commands::map_style_descriptor,
+            commands::export_comparison_segment
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

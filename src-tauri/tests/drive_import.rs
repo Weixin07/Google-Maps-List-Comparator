@@ -5,8 +5,8 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use tauri_app_lib::{
-    AppConfig, GoogleServices, ListSlot, SecretVault, TelemetryClient, bootstrap,
-    enqueue_place_hashes, parse_kml, persist_rows,
+    bootstrap, enqueue_place_hashes, parse_kml, persist_rows, AppConfig, GoogleServices, ListSlot,
+    SecretVault, TelemetryClient,
 };
 
 const SAMPLE_KML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -46,17 +46,14 @@ async fn device_flow_and_import_roundtrip() {
     );
 
     server.expect(
-        Expectation::matching(all_of!(
-            request::method("POST"),
-            request::path("/token")
-        ))
-        .respond_with(json_encoded(json!({
-            "access_token": "ya29.access",
-            "refresh_token": "ya29.refresh",
-            "expires_in": 3600,
-            "scope": "drive.readonly",
-            "token_type": "Bearer"
-        }))),
+        Expectation::matching(all_of!(request::method("POST"), request::path("/token")))
+            .respond_with(json_encoded(json!({
+                "access_token": "ya29.access",
+                "refresh_token": "ya29.refresh",
+                "expires_in": 3600,
+                "scope": "drive.readonly",
+                "token_type": "Bearer"
+            }))),
     );
 
     server.expect(
@@ -107,10 +104,7 @@ async fn device_flow_and_import_roundtrip() {
         "GOOGLE_USERINFO_ENDPOINT",
         server.url("/userinfo").to_string(),
     );
-    std::env::set_var(
-        "GOOGLE_DRIVE_API_BASE",
-        server.url("/drive/v3").to_string(),
-    );
+    std::env::set_var("GOOGLE_DRIVE_API_BASE", server.url("/drive/v3").to_string());
 
     let vault = SecretVault::in_memory();
     let config = AppConfig::from_env();
@@ -147,8 +141,15 @@ async fn device_flow_and_import_roundtrip() {
     let dir = tempdir().unwrap();
     let bootstrap_ctx = bootstrap(dir.path(), "import.db", &vault).expect("bootstrap db");
     let mut connection = bootstrap_ctx.context.connection;
-    let summary =
-        persist_rows(&mut connection, ListSlot::A, "drive-file", &rows).expect("persist rows");
+    let project_id: i64 = connection
+        .query_row(
+            "SELECT id FROM comparison_projects WHERE is_active = 1 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("project id");
+    let summary = persist_rows(&mut connection, project_id, ListSlot::A, "drive-file", &rows)
+        .expect("persist rows");
     assert_eq!(summary.row_count, 1);
 
     let telemetry = TelemetryClient::new(dir.path(), &config).expect("telemetry");

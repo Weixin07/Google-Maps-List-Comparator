@@ -1,10 +1,14 @@
 use serde::Serialize;
 use serde_json::Value;
+use std::path::PathBuf;
 
+use crate::comparison::{ComparisonSegment, ComparisonSnapshot};
 use crate::config::PublicAppConfig;
 use crate::google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity};
 use crate::ingestion::{ImportSummary, ListSlot};
-use crate::AppState;
+use crate::places::NormalizationStats;
+use crate::projects::ComparisonProjectRecord;
+use crate::{AppState, ExportSummary, MapStyleDescriptor};
 
 #[derive(Debug, Serialize)]
 pub struct FoundationHealth {
@@ -94,13 +98,94 @@ pub async fn drive_list_kml_files(
 #[tauri::command]
 pub async fn drive_import_kml(
     state: tauri::State<'_, AppState>,
+    project_id: Option<i64>,
     slot: String,
     file_id: String,
     file_name: String,
 ) -> Result<ImportSummary, String> {
     let parsed_slot = ListSlot::parse(&slot).map_err(|err| err.to_string())?;
     state
-        .import_drive_file(parsed_slot, file_id, file_name)
+        .import_drive_file(project_id, parsed_slot, file_id, file_name)
         .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_place_details(
+    state: tauri::State<'_, AppState>,
+    project_id: Option<i64>,
+    slot: Option<String>,
+) -> Result<Vec<NormalizationStats>, String> {
+    let parsed = match slot {
+        Some(value) => Some(vec![ListSlot::parse(&value).map_err(|err| err.to_string())?]),
+        None => None,
+    };
+    state
+        .refresh_place_details(project_id, parsed)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn compare_lists(
+    state: tauri::State<'_, AppState>,
+    project_id: Option<i64>,
+) -> Result<ComparisonSnapshot, String> {
+    state
+        .comparison_snapshot(project_id)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn list_comparison_projects(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ComparisonProjectRecord>, String> {
+    state
+        .list_comparison_projects()
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn create_comparison_project(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    activate: Option<bool>,
+) -> Result<ComparisonProjectRecord, String> {
+    state
+        .create_comparison_project(name, activate.unwrap_or(true))
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn set_active_comparison_project(
+    state: tauri::State<'_, AppState>,
+    project_id: i64,
+) -> Result<ComparisonProjectRecord, String> {
+    state
+        .set_active_comparison_project(project_id)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn map_style_descriptor(
+    state: tauri::State<'_, AppState>,
+) -> Result<MapStyleDescriptor, String> {
+    Ok(state.map_style_descriptor())
+}
+
+#[tauri::command]
+pub async fn export_comparison_segment(
+    state: tauri::State<'_, AppState>,
+    project_id: Option<i64>,
+    segment: String,
+    format: String,
+    destination: String,
+    place_ids: Option<Vec<String>>,
+) -> Result<ExportSummary, String> {
+    let parsed_segment = ComparisonSegment::parse(&segment)
+        .ok_or_else(|| format!("unsupported comparison segment: {segment}"))?;
+    let path = PathBuf::from(destination);
+    state
+        .export_comparison_segment(project_id, parsed_segment, &format, place_ids, path)
         .map_err(|err| err.to_string())
 }

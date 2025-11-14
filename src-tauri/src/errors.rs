@@ -18,6 +18,8 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Csv(#[from] csv::Error),
     #[error("{0}")]
     Config(String),
     #[error(transparent)]

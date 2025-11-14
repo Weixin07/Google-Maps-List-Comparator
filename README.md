@@ -12,9 +12,15 @@ Hardening pass for the Sprint 0 platform baseline: a Tauri + React desktop harne
 ## Sprint 2 Highlights
 
 - **Google OAuth device flow**: `google_start_device_flow` / `google_complete_sign_in` commands drive the desktop-friendly flow, storing access + refresh tokens in the OS keychain. The React shell guides users through the verification code and shows token lifetimes.
-- **Drive picker & ingestion**: the UI now lists Drive files filtered to `application/vnd.google-earth.kml+xml`, lets users assign “List A/B”, and streams downloads through the Rust backend with progress notifications. Imports parse KML placemarks into normalized rows, hash every source + place identifier, and persist them into the `raw_items` table for later normalization.
+- **Drive picker & ingestion**: the UI now lists Drive files filtered to `application/vnd.google-earth.kml+xml`, lets users assign "List A/B", and streams downloads through the Rust backend with progress notifications. Imports parse KML placemarks into normalized rows, hash every source + place identifier, and persist them into the `raw_items` table for later normalization.
 - **Telemetry coverage**: signin, file selection, import start/completion, and every ingested row emit hashed identifiers into the offline telemetry queue so privacy is preserved even while offline.
-- **QA harness**: `pnpm qa:drive` spins up a local HTTP stub so manual testing (or screenshots) doesn’t require real Google credentials.
+- **QA harness**: `pnpm qa:drive` spins up a local HTTP stub so manual testing (or screenshots) doesn't require real Google credentials.
+
+## Sprint 3 Highlights
+
+- **Places normalization queue**: rows missing a `place_id` are funneled through a single-threaded queue that honors a 3 QPS budget, exponential backoff, and jitter. Lookups hit `normalization_cache` before reusing persisted `places` rows; only truly unknown rows trigger the Places Search API (or the deterministic synthetic resolver during local dev). `list_places` timestamps are rewritten atomically so downstream comparison math stays in sync.
+- **Manual refresh**: the new `refresh_place_details` Tauri command reuses the same queue logic and surfaces in the UI as a "Refresh details" action. Telemetry now includes per-import stats for total rows, cache hits, Places calls, and pending lookups so rate limiters/regressions are easy to spot.
+- **Comparison engine**: a `compare_lists` command computes overlap, A-only, and B-only sets directly from the normalized DB state, including pending counts derived from `raw_items`. React renders the snapshot with live counts and the top normalized places for each partition so QA can see deterministic results immediately after an import.
 
 ## Development Workflow
 
