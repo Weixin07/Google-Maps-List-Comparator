@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   ComparisonSegmentKey,
   PlaceComparisonRow,
@@ -7,6 +7,7 @@ import type {
 export type TableFilters = {
   search: string;
   type: string;
+  category: string;
   sortKey: "name" | "address";
   sortDirection: "asc" | "desc";
 };
@@ -18,6 +19,7 @@ type ComparisonTableProps = {
   totalCount: number;
   filters: TableFilters;
   availableTypes: string[];
+  availableCategories: string[];
   selectedIds: Set<string>;
   focusedPlaceId: string | null;
   onFiltersChange: (segment: ComparisonSegmentKey, filters: TableFilters) => void;
@@ -36,12 +38,15 @@ export function ComparisonTable({
   totalCount,
   filters,
   availableTypes,
+  availableCategories,
   selectedIds,
   focusedPlaceId,
   onFiltersChange,
   onSelectionChange,
   onRowFocus,
 }: ComparisonTableProps) {
+  const [activeIndex, setActiveIndex] = useState(0);
+
   const sortedRows = useMemo(() => {
     const copy = [...rows];
     const direction = filters.sortDirection === "asc" ? 1 : -1;
@@ -59,6 +64,16 @@ export function ComparisonTable({
     });
   }, [rows, filters.sortDirection, filters.sortKey]);
 
+  useEffect(() => {
+    if (!focusedPlaceId) {
+      return;
+    }
+    const index = sortedRows.findIndex((row) => row.place_id === focusedPlaceId);
+    if (index >= 0) {
+      setActiveIndex(index);
+    }
+  }, [focusedPlaceId, sortedRows]);
+
   const allVisibleSelected =
     sortedRows.length > 0 &&
     sortedRows.every((row) => selectedIds.has(row.place_id));
@@ -69,6 +84,10 @@ export function ComparisonTable({
 
   const handleTypeChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     onFiltersChange(segment, { ...filters, type: event.target.value });
+  };
+
+  const handleCategoryChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    onFiltersChange(segment, { ...filters, category: event.target.value });
   };
 
   const toggleSort = (key: TableFilters["sortKey"]) => {
@@ -90,6 +109,39 @@ export function ComparisonTable({
       sortedRows.map((row) => row.place_id),
       event.target.checked,
     );
+  };
+
+  const handleTableKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (sortedRows.length === 0) {
+      return;
+    }
+    const target = event.target as HTMLElement;
+    if (
+      target.tagName === "INPUT" ||
+      target.tagName === "SELECT" ||
+      target.tagName === "BUTTON"
+    ) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      const next = Math.min(sortedRows.length - 1, activeIndex + 1);
+      setActiveIndex(next);
+      onRowFocus(segment, sortedRows[next]);
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const prev = Math.max(0, activeIndex - 1);
+      setActiveIndex(prev);
+      onRowFocus(segment, sortedRows[prev]);
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const row = sortedRows[activeIndex];
+      if (row) {
+        onRowFocus(segment, row);
+      }
+    }
   };
 
   return (
@@ -117,6 +169,14 @@ export function ComparisonTable({
               </option>
             ))}
           </select>
+          <select value={filters.category} onChange={handleCategoryChange}>
+            <option value="">All categories</option>
+            {availableCategories.map((category) => (
+              <option key={`${segment}-cat-${category}`} value={category}>
+                {category}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
       <div className="comparison-table__actions">
@@ -141,7 +201,11 @@ export function ComparisonTable({
       {sortedRows.length === 0 ? (
         <p className="muted">No places match the current filters.</p>
       ) : (
-        <div className="comparison-table__scroll">
+        <div
+          className="comparison-table__scroll"
+          tabIndex={0}
+          onKeyDown={handleTableKeyDown}
+        >
           <table>
             <thead>
               <tr>

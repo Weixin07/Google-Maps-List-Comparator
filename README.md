@@ -2,6 +2,8 @@
 
 Hardening pass for the Sprint 0 platform baseline: a Tauri + React desktop harness with SQLCipher storage, secure key handling, and telemetry buffering that future sprints can trust without revisiting infrastructure.
 
+> Need day-to-day instructions? See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for a walkthrough of setup, Drive/OAuth sign-in, importing, refreshing, filtering, and exporting data.
+
 ## Platform Baseline
 
 - **SQLCipher bootstrap + recovery**: on every launch we derive an encryption key from the OS keychain, run migrations, verify the file header is encrypted, and automatically recycle both the database file and key if the stored material is missing or corrupted. Recovery status and key lifecycle (`created`, `retrieved`, `rotated`) surface via the `FoundationHealth` UI/state API.
@@ -28,6 +30,13 @@ Hardening pass for the Sprint 0 platform baseline: a Tauri + React desktop harne
 - **Telemetry uplink**: the TypeScript telemetry adapter hashes `place_id` values with a per-install salt, falls back to the Tauri queue when offline, and can stream buffered batches to any PostHog-compatible endpoint.
 - **Packaging polish**: the NSIS template now ships the real product name/icons, embeds the WebView2 bootstrapper, and the README documents the unsigned installer expectations plus how secrets flow into `pnpm tauri build`.
 - **CI/CD release hooks**: GitHub Actions lint/type/test, build the Windows installer, upload it as an artifact, and attach it to a draft GitHub Release whenever a `v*` tag lands on `main`.
+
+## Sprint 5 Highlights
+
+- **Import resilience**: Drive imports now stream granular progress updates, surface detailed error diagnostics per file, and offer both per-slot and "retry all failed" controls. Logs reference hashed identifiers only so Drive file IDs never leak.
+- **Bulk refresh queue**: refreshing Google Places data is now a queued operation with rate-limit aware progress bars, telemetry for completion vs. cancellation, and dedicated pause/cancel controls. The UI happily works through dozens of refresh jobs without overwhelming the Places API.
+- **Table & map polish**: comparison tables add keyboard navigation, category filters, and per-project persistence so filters and map layer visibility survive context switches. The map clusters dense markers and labels cluster counts for clearer exploration.
+- **Docs & support**: a user guide walks through setup, OAuth, importing, refreshing, and exporting. README sections cover troubleshooting, telemetry/privacy, and a release checklist so anyone can prep the app for distribution.
 
 ## Development Workflow
 
@@ -80,3 +89,41 @@ Run these from the repository root:
 ## IDE / Tooling
 
 Any editor works; VS Code with the Tauri + rust-analyzer extensions provides the smoothest DX for React + Rust cross-over editing.
+
+## Setup & Configuration
+
+1. **Install dependencies**: `pnpm install` pulls the front-end workspace while `cargo` is fetched automatically via Tauri when you run the desktop shell.
+2. **Populate `.env`**: copy `.env.development` to `.env.local` for secrets you do not want checked in. At minimum set `GOOGLE_OAUTH_CLIENT_ID/SECRET`, `GOOGLE_DEVICE_CODE_ENDPOINT`, `GOOGLE_TOKEN_ENDPOINT`, and `GOOGLE_DRIVE_API_BASE` (point it at the QA stub via `pnpm qa:drive` when iterating).
+3. **Provide Places API keys**: set `GOOGLE_PLACES_API_KEY` so the Places normalizer can reach Google’s API, or rely on the synthetic resolver for offline tests.
+4. **Run the app**: `pnpm tauri dev` starts the native shell; the Drive panel will block you from importing until OAuth is configured.
+5. **Persist preferences**: table filters and map layer visibility are saved per comparison project, so feel free to tune filters knowing they will return when you hop back to a project.
+
+## OAuth & API Keys
+
+- **Device flow**: the Drive panel uses Google’s OAuth device flow. When you click “Sign in with Google” we open the verification URL in your default browser and poll until you approve the request. No secrets ever sit in the repo; the token lives in the OS keychain.
+- **Drive scope**: imports solely request `drive.readonly`, scoped to KML files. Every file selection and import emits hashed IDs to telemetry so we can trace behavior without exfiltrating Drive IDs.
+- **Places API**: the refresh queue honors the `places_rate_limit_qps` value surfaced in the settings panel. Update it in-app or via `RuntimeSettings` to match your quota.
+- **Map tiles**: configure `MAPTILER_API_KEY` (or another MapLibre-compatible style URL) via `map_style_descriptor` to render custom basemaps.
+
+## Telemetry & Privacy
+
+- **Hashing everywhere**: Drive file IDs and Place IDs are salted before they leave the client. Both the Tauri telemetry buffer and the optional network uploader only see hashed identifiers.
+- **Offline buffer**: telemetry events (signin, import start/completion, refresh queue lifecycle, errors) drain into a JSONL buffer capped at the configured rotation window. Inspect `telemetry-buffer.jsonl` anytime you need to audit behavior.
+- **Runtime toggle**: the settings pane exposes a telemetry toggle. Disabling it flushes the in-memory queue and the UI respects the setting immediately.
+- **Event hints**: new events include `refresh_job_enqueued/refresh_job_completed`, `import_failed`, and per-row hashing for Drive imports so flaky flows can be diagnosed without raw IDs.
+
+## Troubleshooting
+
+- **Drive sign-in never completes**: ensure the device-code page displays the correct client ID; if you see an “invalid device code” error, restart the flow—codes expire quickly. Running `pnpm qa:drive` locally is handy for testing without hitting production Google endpoints.
+- **Imports show “Select a Drive KML” even with a file selected**: check that your comparison project is active. Imports are project-scoped; the UI now surfaces per-slot errors with retry buttons so you can recover without reloading the app.
+- **Refresh queue won’t start**: the queue pauses automatically when you click “Pause queue” or when no projects are active. Resume the queue or enqueue a new job. The “Cancel active” button sends a cancellation signal to the backend; status changes to “cancelled” once the in-flight row completes.
+- **Clusters never expand**: cluster circles require at least two points. If clicking a cluster does nothing, ensure MapLibre can fetch the style URL (check your API key) and that `comparison-clusters` layer is visible (toggle one of the segment checkboxes back on).
+- **Telemetry buffer errors**: if you see `telemetry upload failed` in the console, double-check write permissions for the data directory or run `pnpm tauri dev` from a writable location. Buffer rotations fall back to truncation if disk-space is exhausted.
+
+## Release Checklist
+
+1. **Sync secrets**: provide production `GOOGLE_*` credentials, `GOOGLE_PLACES_API_KEY`, and any map tiles keys via the environment or CI secrets.
+2. **Smoke test**: run `pnpm smoke` locally to exercise lint, type-check, vitest, and the Rust test suite.
+3. **Manual flows**: with the QA Drive stub running (`pnpm qa:drive`), take screenshots of the Drive import, refresh queue, and map clustering surfaces for release notes.
+4. **Inspect telemetry buffer**: confirm no unexpected identifiers show up in `telemetry-buffer.jsonl` and that hashed IDs are present.
+5. **Package & tag**: `pnpm tauri build` generates the NSIS installer; tag `v*` to trigger the CI workflow that uploads artifacts to a draft GitHub Release along with the updated README + user guide link.

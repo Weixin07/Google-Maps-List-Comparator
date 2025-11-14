@@ -77,6 +77,23 @@ export function ComparisonMap({
     map.on("load", () => {
       map.addSource("comparison-places", {
         type: "geojson",
+        cluster: true,
+        clusterMaxZoom: 12,
+        clusterRadius: 45,
+        clusterProperties: {
+          overlap: [
+            "+",
+            ["case", ["==", ["get", "segment"], "overlap"], 1, 0],
+          ],
+          only_a: [
+            "+",
+            ["case", ["==", ["get", "segment"], "only_a"], 1, 0],
+          ],
+          only_b: [
+            "+",
+            ["case", ["==", ["get", "segment"], "only_b"], 1, 0],
+          ],
+        },
         data: {
           type: "FeatureCollection",
           features: [],
@@ -84,13 +101,75 @@ export function ComparisonMap({
       });
       const baseSource = map.getSource("comparison-places") as GeoJSONSource | undefined;
       baseSource?.setData(geojsonRef.current);
+      map.addLayer({
+        id: "comparison-clusters",
+        type: "circle",
+        source: "comparison-places",
+        filter: ["has", "point_count"],
+        paint: {
+          "circle-color": "#2563eb",
+          "circle-radius": [
+            "step",
+            ["get", "point_count"],
+            18,
+            25,
+            24,
+            75,
+            32,
+          ],
+          "circle-opacity": 0.75,
+        },
+      });
+      map.addLayer({
+        id: "comparison-cluster-count",
+        type: "symbol",
+        source: "comparison-places",
+        filter: ["has", "point_count"],
+        layout: {
+          "text-field": ["get", "point_count"],
+          "text-size": 12,
+        },
+        paint: {
+          "text-color": "#f8fafc",
+        },
+      });
+      map.on("click", "comparison-clusters", (event) => {
+        const feature = event.features?.[0];
+        if (!feature) {
+          return;
+        }
+        const clusterId = feature.properties?.cluster_id;
+        const coordinates =
+          feature.geometry?.type === "Point"
+            ? (feature.geometry.coordinates as [number, number])
+            : undefined;
+        const source = map.getSource("comparison-places") as GeoJSONSource | undefined;
+        if (clusterId && source && coordinates) {
+          source.getClusterExpansionZoom(clusterId, (err, zoom) => {
+            if (err || zoom == null) {
+              return;
+            }
+            map.easeTo({ center: coordinates, zoom });
+          });
+        }
+      });
+      map.on("mouseenter", "comparison-clusters", () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+      map.on("mouseleave", "comparison-clusters", () => {
+        map.getCanvas().style.cursor = "";
+      });
       (Object.keys(layerColors) as ComparisonSegmentKey[]).forEach(
         (segment) => {
           map.addLayer({
             id: `comparison-${segment}`,
             type: "circle",
             source: "comparison-places",
-            filter: ["==", ["get", "segment"], segment],
+            filter: [
+              "all",
+              ["!", ["has", "point_count"]],
+              ["==", ["get", "segment"], segment],
+            ],
             paint: {
               "circle-radius": 6,
               "circle-color": layerColors[segment],
@@ -166,6 +245,21 @@ export function ComparisonMap({
         );
       }
     });
+    const clusterVisible = Object.values(visibility).some(Boolean);
+    if (map.getLayer("comparison-clusters")) {
+      map.setLayoutProperty(
+        "comparison-clusters",
+        "visibility",
+        clusterVisible ? "visible" : "none",
+      );
+    }
+    if (map.getLayer("comparison-cluster-count")) {
+      map.setLayoutProperty(
+        "comparison-cluster-count",
+        "visibility",
+        clusterVisible ? "visible" : "none",
+      );
+    }
   }, [visibility]);
 
   useEffect(() => {

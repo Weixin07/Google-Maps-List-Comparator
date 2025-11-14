@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { open } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { FoundationHealth, RuntimeSettings } from "./types/foundation";
 import type {
   ComparisonProjectRecord,
@@ -52,6 +52,43 @@ type ImportProgressPayload = {
   progress: number;
   error?: string | null;
   file_name?: string | null;
+  details?: string[] | null;
+};
+
+type RefreshProgressPayload = {
+  slot: string;
+  request_id?: string | null;
+  stage: string;
+  processed: number;
+  total_rows: number;
+  resolved: number;
+  pending: number;
+  rate_limit_qps: number;
+  message: string;
+};
+
+type RefreshJobStatus = "queued" | "running" | "complete" | "cancelled" | "error";
+
+type RefreshJob = {
+  id: string;
+  slot: ListSlot;
+  status: RefreshJobStatus;
+  processed: number;
+  total: number;
+  resolved: number;
+  pending: number;
+  message: string;
+  startedAt?: number;
+  finishedAt?: number;
+};
+
+type ImportAttemptRecord = {
+  id: string;
+  fileName?: string;
+  finishedAt: number;
+  status: "success" | "error";
+  summary: string;
+  details?: string[];
 };
 
 type ImportState = {
@@ -60,6 +97,10 @@ type ImportState = {
   progress: number;
   fileName?: string;
   error?: string;
+  errorDetails?: string[];
+  attemptId?: string;
+  startedAt?: number;
+  history: ImportAttemptRecord[];
 };
 
 type NormalizationStats = {
@@ -113,15 +154,18 @@ const upcomingMilestones = [
   { title: "Places normalization", detail: "Rate-limited resolver & cache" },
 ];
 
-const defaultImportState: ImportState = {
+const createImportState = (): ImportState => ({
   stage: "idle",
   message: "Waiting for Drive selection",
   progress: 0,
-};
+  history: [],
+});
 
 const listSlots: ListSlot[] = ["A", "B"];
 
 const segmentKeys: ComparisonSegmentKey[] = ["overlap", "only_a", "only_b"];
+
+type SegmentPropertyKey = "overlap" | "only_a" | "only_b";
 
 const segmentLabels: Record<ComparisonSegmentKey, string> = {
   overlap: "Shared places",
@@ -129,7 +173,7 @@ const segmentLabels: Record<ComparisonSegmentKey, string> = {
   only_b: "Only List B",
 };
 
-const segmentPropertyMap: Record<ComparisonSegmentKey, keyof ComparisonSnapshot> = {
+const segmentPropertyMap: Record<ComparisonSegmentKey, SegmentPropertyKey> = {
   overlap: "overlap",
   only_a: "only_a",
   only_b: "only_b",
@@ -140,11 +184,63 @@ const segmentColors: Record<ComparisonSegmentKey, string> = {
   only_a: "#0ea5e9",
   only_b: "#9333ea",
 };
+const defaultLayerVisibility: Record<ComparisonSegmentKey, boolean> = {
+  overlap: true,
+  only_a: true,
+  only_b: true,
+};
+
+type PersistedPreferences = {
+  filters: Record<ComparisonSegmentKey, TableFilters>;
+  layerVisibility: Record<ComparisonSegmentKey, boolean>;
+};
+
+const preferenceKey = (projectId: number) => `gmlc-preferences-${projectId}`;
+
+const loadPreferences = (projectId: number): PersistedPreferences | null => {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(preferenceKey(projectId));
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as PersistedPreferences;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const derivedCategories = [
+  { label: "Food & Drink", matches: ["restaurant", "food", "cafe", "bar", "bakery"] },
+  { label: "Coffee & Tea", matches: ["coffee", "tea"] },
+  { label: "Shopping", matches: ["store", "shopping", "market", "mall"] },
+  { label: "Lodging", matches: ["lodging", "hotel", "motel", "hostel"] },
+  { label: "Outdoors", matches: ["park", "trail", "campground", "beach"] },
+  { label: "Arts & Culture", matches: ["art", "museum", "gallery", "library"] },
+  { label: "Services", matches: ["service", "bank", "atm", "post_office"] },
+  { label: "Entertainment", matches: ["theater", "stadium", "amusement"] },
+];
+
+const resolveCategory = (types: string[]): string => {
+  if (types.length === 0) {
+    return "Uncategorized";
+  }
+  const lower = types.map((type) => type.toLowerCase());
+  for (const group of derivedCategories) {
+    if (lower.some((type) => group.matches.some((keyword) => type.includes(keyword)))) {
+      return group.label;
+    }
+  }
+  return "Other";
+};
 
 const initialFilters = (): Record<ComparisonSegmentKey, TableFilters> => ({
-  overlap: { search: "", type: "", sortKey: "name", sortDirection: "asc" },
-  only_a: { search: "", type: "", sortKey: "name", sortDirection: "asc" },
-  only_b: { search: "", type: "", sortKey: "name", sortDirection: "asc" },
+  overlap: { search: "", type: "", category: "", sortKey: "name", sortDirection: "asc" },
+  only_a: { search: "", type: "", category: "", sortKey: "name", sortDirection: "asc" },
+  only_b: { search: "", type: "", category: "", sortKey: "name", sortDirection: "asc" },
 });
 
 const initialSelections = (): Record<ComparisonSegmentKey, Set<string>> => ({
@@ -170,10 +266,10 @@ function App() {
     A: null,
     B: null,
   });
-  const [imports, setImports] = useState<Record<ListSlot, ImportState>>({
-    A: defaultImportState,
-    B: defaultImportState,
-  });
+  const [imports, setImports] = useState<Record<ListSlot, ImportState>>(() => ({
+    A: createImportState(),
+    B: createImportState(),
+  }));
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
   const [pendingRateLimit, setPendingRateLimit] = useState<number | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -181,7 +277,10 @@ function App() {
   const [comparison, setComparison] = useState<ComparisonSnapshot | null>(null);
   const [comparisonError, setComparisonError] = useState<string | null>(null);
   const [isLoadingComparison, setIsLoadingComparison] = useState(false);
-  const [isRefreshingPlaces, setIsRefreshingPlaces] = useState(false);
+  const [refreshQueue, setRefreshQueue] = useState<RefreshJob[]>([]);
+  const [isRefreshPaused, setIsRefreshPaused] = useState(false);
+  const refreshRunnerRef = useRef<string | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ComparisonProjectRecord[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<number | null>(null);
   const [isLoadingProjects, setIsLoadingProjects] = useState(false);
@@ -191,13 +290,79 @@ function App() {
     useState<Record<ComparisonSegmentKey, TableFilters>>(() => initialFilters());
   const [selections, setSelections] =
     useState<Record<ComparisonSegmentKey, Set<string>>>(() => initialSelections());
-  const [layerVisibility, setLayerVisibility] = useState<
-    Record<ComparisonSegmentKey, boolean>
-  >({
-    overlap: true,
-    only_a: true,
-    only_b: true,
-  });
+  const [layerVisibility, setLayerVisibility] =
+    useState<Record<ComparisonSegmentKey, boolean>>({
+      ...defaultLayerVisibility,
+    });
+  const persistPreferences = useCallback(
+    (
+      nextFilters: Record<ComparisonSegmentKey, TableFilters>,
+      nextVisibility: Record<ComparisonSegmentKey, boolean>,
+    ) => {
+      if (!activeProjectId || typeof window === "undefined" || !window.localStorage) {
+        return;
+      }
+      try {
+        window.localStorage.setItem(
+          preferenceKey(activeProjectId),
+          JSON.stringify({ filters: nextFilters, layerVisibility: nextVisibility }),
+        );
+      } catch {
+        // ignore storage failures
+      }
+    },
+    [activeProjectId],
+  );
+  const enqueueRefresh = useCallback(
+    (target?: ListSlot) => {
+      if (!activeProjectId) {
+        setComparisonError("Create or select a comparison project first.");
+        return;
+      }
+      const targets = target ? [target] : listSlots;
+      const nextJobs: RefreshJob[] = targets.map((slot) => {
+        const id =
+          window.crypto?.randomUUID?.() ??
+          `${slot}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        telemetry.track("refresh_job_enqueued", { slot });
+        return {
+          id,
+          slot,
+          status: "queued",
+          processed: 0,
+          total:
+            slot === "A"
+              ? comparison?.stats.list_a_count ?? 0
+              : comparison?.stats.list_b_count ?? 0,
+          resolved: 0,
+          pending:
+            slot === "A"
+              ? comparison?.stats.pending_a ?? 0
+              : comparison?.stats.pending_b ?? 0,
+          message: "Queued for refresh",
+        };
+      });
+      setRefreshQueue((prev) => [...prev, ...nextJobs]);
+      setRefreshError(null);
+    },
+    [activeProjectId, comparison],
+  );
+
+  const toggleRefreshPause = useCallback(() => {
+    setIsRefreshPaused((prev) => !prev);
+  }, []);
+
+  const cancelActiveRefresh = useCallback(() => {
+    void invoke("cancel_refresh_queue").catch((error) => {
+      setRefreshError(normalizeError(error));
+    });
+  }, []);
+
+  const clearFinishedRefreshJobs = useCallback(() => {
+    setRefreshQueue((prev) =>
+      prev.filter((job) => job.status === "queued" || job.status === "running"),
+    );
+  }, []);
   const [mapStyleDescriptor, setMapStyleDescriptor] =
     useState<MapStyleDescriptor | null>(null);
   const [focusedPlaceId, setFocusedPlaceId] = useState<string | null>(null);
@@ -256,40 +421,6 @@ function App() {
     [],
   );
 
-  const refreshPlaces = useCallback(
-    async (slot?: ListSlot) => {
-      if (!activeProjectId) {
-        setComparisonError("Create or select a comparison project first.");
-        return;
-      }
-      setIsRefreshingPlaces(true);
-      setComparisonError(null);
-      try {
-        const payload = {
-          projectId: activeProjectId,
-          ...(slot ? { slot } : {}),
-        };
-        const stats = await invoke<NormalizationStats[]>(
-          "refresh_place_details",
-          payload,
-        );
-        const refreshed = stats.reduce((total, entry) => total + entry.resolved, 0);
-        const pending = stats.reduce((total, entry) => total + entry.unresolved, 0);
-        telemetry.track("places_refresh_triggered", {
-          slot: slot ?? "both",
-          refreshed,
-          pending,
-        });
-        await loadComparison(activeProjectId);
-      } catch (error) {
-        setComparisonError(normalizeError(error));
-      } finally {
-        setIsRefreshingPlaces(false);
-      }
-    },
-    [activeProjectId, loadComparison],
-  );
-
   useEffect(() => {
     telemetry.track("ui_boot", { mode });
     return () => {
@@ -318,16 +449,50 @@ function App() {
         return;
       }
       const slot: ListSlot = event.payload.slot?.toUpperCase() === "B" ? "B" : "A";
-      setImports((prev) => ({
-        ...prev,
-        [slot]: {
-          stage: event.payload.stage,
-          message: event.payload.message,
-          progress: event.payload.progress,
-          fileName: event.payload.file_name ?? prev[slot].fileName,
-          error: event.payload.error ?? undefined,
-        },
-      }));
+      setImports((prev) => {
+        const previous = prev[slot];
+        const now = Date.now();
+        const isTerminal =
+          event.payload.stage === "complete" || event.payload.stage === "error";
+        const attemptId = previous.attemptId ?? `${slot}-${now}`;
+        const startedAt = previous.startedAt ?? now;
+        const detailList =
+          event.payload.stage === "error"
+            ? event.payload.details?.filter((detail) => detail.trim().length > 0) ??
+              (event.payload.error ? [event.payload.error] : [])
+            : undefined;
+        const nextHistory = isTerminal
+          ? [
+              {
+                id: attemptId,
+                fileName: event.payload.file_name ?? previous.fileName,
+                finishedAt: now,
+                status: event.payload.stage === "complete" ? "success" : "error",
+                summary: event.payload.message,
+                details: detailList,
+              },
+              ...previous.history,
+            ].slice(0, 5)
+          : previous.history;
+        return {
+          ...prev,
+          [slot]: {
+            ...previous,
+            stage: event.payload.stage,
+            message: event.payload.message,
+            progress: event.payload.progress,
+            fileName: event.payload.file_name ?? previous.fileName,
+            error:
+              event.payload.stage === "error"
+                ? event.payload.error ?? event.payload.message
+                : undefined,
+            errorDetails: detailList,
+            history: nextHistory,
+            attemptId: isTerminal ? undefined : attemptId,
+            startedAt: isTerminal ? undefined : startedAt,
+          },
+        };
+      });
       if (event.payload.stage === "complete" && activeProjectId) {
         void loadComparison(activeProjectId);
       }
@@ -390,26 +555,33 @@ useEffect(() => {
   }, [activeProjectId, loadComparison]);
 
   useEffect(() => {
-    setFilters(initialFilters());
+    const stored =
+      activeProjectId != null ? loadPreferences(activeProjectId) : null;
+    setFilters(stored?.filters ?? initialFilters());
+    setLayerVisibility(stored?.layerVisibility ?? { ...defaultLayerVisibility });
     setSelections(initialSelections());
     setFocusedPlaceId(null);
     setFocusPoint(null);
     setExportStatus(null);
     setSelectedFiles({ A: null, B: null });
     setImports({
-      A: defaultImportState,
-      B: defaultImportState,
+      A: createImportState(),
+      B: createImportState(),
     });
   }, [activeProjectId]);
 
   const handleFiltersChange = useCallback(
     (segment: ComparisonSegmentKey, nextFilters: TableFilters) => {
-      setFilters((prev) => ({
-        ...prev,
-        [segment]: nextFilters,
-      }));
+      setFilters((prev) => {
+        const updated = {
+          ...prev,
+          [segment]: nextFilters,
+        };
+        persistPreferences(updated, layerVisibility);
+        return updated;
+      });
     },
-    [],
+    [layerVisibility, persistPreferences],
   );
 
   const handleSelectionChange = useCallback(
@@ -474,12 +646,19 @@ useEffect(() => {
     [comparison, emitPlaceFocus],
   );
 
-  const handleLayerToggle = useCallback((segment: ComparisonSegmentKey) => {
-    setLayerVisibility((prev) => ({
-      ...prev,
-      [segment]: !prev[segment],
-    }));
-  }, []);
+  const handleLayerToggle = useCallback(
+    (segment: ComparisonSegmentKey) => {
+      setLayerVisibility((prev) => {
+        const updated = {
+          ...prev,
+          [segment]: !prev[segment],
+        };
+        persistPreferences(filters, updated);
+        return updated;
+      });
+    },
+    [filters, persistPreferences],
+  );
 
   const handleProjectChange = useCallback(async (projectId: number) => {
     if (!Number.isFinite(projectId) || projectId <= 0) {
@@ -551,6 +730,38 @@ useEffect(() => {
     return counts;
   }, [comparison]);
 
+  const categoryOptions = useMemo(() => {
+    const defaults: Record<ComparisonSegmentKey, string[]> = {
+      overlap: [],
+      only_a: [],
+      only_b: [],
+    };
+    if (!comparison) {
+      return defaults;
+    }
+    return segmentKeys.reduce((acc, segment) => {
+      const rows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      const unique = new Set<string>();
+      rows.forEach((row) => unique.add(resolveCategory(row.types)));
+      acc[segment] = Array.from(unique).sort((a, b) => a.localeCompare(b));
+      return acc;
+    }, defaults);
+  }, [comparison]);
+
+  const categoryMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!comparison) {
+      return map;
+    }
+    segmentKeys.forEach((segment) => {
+      const rows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      rows.forEach((row) => {
+        map.set(row.place_id, resolveCategory(row.types));
+      });
+    });
+    return map;
+  }, [comparison]);
+
   const filteredRows = useMemo(() => {
     const defaults: Record<ComparisonSegmentKey, PlaceComparisonRow[]> = {
       overlap: [],
@@ -564,6 +775,7 @@ useEffect(() => {
       const baseRows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
       const search = filters[segment].search.trim().toLowerCase();
       const typeFilter = filters[segment].type;
+      const categoryFilter = filters[segment].category;
       acc[segment] = baseRows.filter((row) => {
         const matchesSearch =
           !search ||
@@ -571,11 +783,15 @@ useEffect(() => {
           (row.formatted_address ?? "").toLowerCase().includes(search) ||
           row.types.some((type) => type.toLowerCase().includes(search));
         const matchesType = !typeFilter || row.types.includes(typeFilter);
-        return matchesSearch && matchesType;
+        const matchesCategory =
+          !categoryFilter ||
+          (categoryMap.get(row.place_id) ?? resolveCategory(row.types)) ===
+            categoryFilter;
+        return matchesSearch && matchesType && matchesCategory;
       });
       return acc;
     }, defaults);
-  }, [comparison, filters]);
+  }, [categoryMap, comparison, filters]);
 
   const mapData = useMemo(() => {
     return segmentKeys.reduce((acc, segment) => {
@@ -678,7 +894,7 @@ useEffect(() => {
     try {
       const flow = await invoke<DeviceFlowState>("google_start_device_flow");
       setDeviceFlow(flow);
-      await open(flow.verification_url);
+      await openUrl(flow.verification_url);
     } catch (error) {
       setSignInError(normalizeError(error));
     } finally {
@@ -731,6 +947,151 @@ useEffect(() => {
     void loadDriveFiles();
   }, [identity, loadDriveFiles]);
 
+  useEffect(() => {
+    let mounted = true;
+    const subscription = listen<RefreshProgressPayload>(
+      "refresh://progress",
+      (event) => {
+        if (!mounted || !event.payload) {
+          return;
+        }
+        const jobId = event.payload.request_id ?? "";
+        if (!jobId) {
+          return;
+        }
+        const stage = event.payload.stage;
+        setRefreshQueue((prev) =>
+          prev.map((job) => {
+            if (job.id !== jobId) {
+              return job;
+            }
+            const nextStatus: RefreshJobStatus =
+              stage === "complete"
+                ? "complete"
+                : stage === "cancelled"
+                  ? "cancelled"
+                  : stage === "error"
+                    ? "error"
+                    : job.status;
+            const finished =
+              stage === "complete" || stage === "cancelled" || stage === "error"
+                ? Date.now()
+                : job.finishedAt;
+            return {
+              ...job,
+              status: nextStatus,
+              processed: event.payload.processed ?? job.processed,
+              total: event.payload.total_rows ?? job.total,
+              resolved: event.payload.resolved ?? job.resolved,
+              pending: event.payload.pending ?? job.pending,
+              message: event.payload.message ?? job.message,
+              finishedAt: finished,
+            };
+          }),
+        );
+        if (
+          ["complete", "cancelled", "error"].includes(stage) &&
+          activeProjectId
+        ) {
+          telemetry.track("refresh_job_completed", {
+            slot: event.payload.slot,
+            status: stage,
+            resolved: event.payload.resolved,
+            pending: event.payload.pending,
+          });
+          void loadComparison(activeProjectId);
+        }
+      },
+    );
+    return () => {
+      mounted = false;
+      void subscription.then((unlisten) => unlisten());
+    };
+  }, [activeProjectId, loadComparison]);
+
+  useEffect(() => {
+    if (isRefreshPaused || refreshRunnerRef.current || !activeProjectId) {
+      return;
+    }
+    const nextJob = refreshQueue.find((job) => job.status === "queued");
+    if (!nextJob) {
+      return;
+    }
+    refreshRunnerRef.current = nextJob.id;
+    setRefreshQueue((prev) =>
+      prev.map((job) =>
+        job.id === nextJob.id
+          ? {
+              ...job,
+              status: "running",
+              startedAt: Date.now(),
+              message: "Preparing refresh…",
+            }
+          : job,
+      ),
+    );
+    setRefreshError(null);
+    void (async () => {
+      try {
+        const stats = await invoke<NormalizationStats[]>("refresh_place_details", {
+          projectId: activeProjectId,
+          slot: nextJob.slot,
+          requestId: nextJob.id,
+        });
+        const summary = stats.find((entry) => entry.slot === nextJob.slot);
+        if (summary) {
+          telemetry.track("places_refresh_triggered", {
+            slot: nextJob.slot,
+            refreshed: summary.resolved,
+            pending: summary.unresolved,
+          });
+        }
+        setRefreshQueue((prev) =>
+          prev.map((job) => {
+            if (job.id !== nextJob.id || job.status !== "running") {
+              return job;
+            }
+            return {
+              ...job,
+              status: "complete",
+              finishedAt: Date.now(),
+              resolved: summary?.resolved ?? job.resolved,
+              pending: summary?.unresolved ?? job.pending,
+              processed:
+                summary?.total_rows != null
+                  ? Math.max(summary.total_rows - summary.unresolved, 0)
+                  : job.processed,
+              total: summary?.total_rows ?? job.total,
+              message: summary
+                ? `Refreshed ${summary.resolved} places`
+                : "Refresh completed",
+            };
+          }),
+        );
+        if (activeProjectId) {
+          await loadComparison(activeProjectId);
+        }
+      } catch (error) {
+        const message = normalizeError(error);
+        setRefreshError(message);
+        setRefreshQueue((prev) =>
+          prev.map((job) =>
+            job.id === nextJob.id
+              ? {
+                  ...job,
+                  status: "error",
+                  finishedAt: Date.now(),
+                  message,
+                }
+              : job,
+          ),
+        );
+      } finally {
+        refreshRunnerRef.current = null;
+      }
+    })();
+  }, [refreshQueue, isRefreshPaused, activeProjectId, loadComparison]);
+
   const handleFileSelection = useCallback(
     (slot: ListSlot, fileId: string) => {
       const file = driveFiles.find((entry) => entry.id === fileId) ?? null;
@@ -758,20 +1119,32 @@ useEffect(() => {
         setImports((prev) => ({
           ...prev,
           [slot]: {
-            ...defaultImportState,
+            ...prev[slot],
+            stage: "idle",
             message: "Select a Drive KML before importing",
+            progress: 0,
+            error: undefined,
+            errorDetails: undefined,
+            attemptId: undefined,
+            startedAt: undefined,
           },
         }));
         return;
       }
 
+      const attemptId = `${slot}-${Date.now()}`;
       setImports((prev) => ({
         ...prev,
         [slot]: {
+          ...prev[slot],
           stage: "starting",
           message: "Preparing import…",
           progress: 0,
           fileName: file.name,
+          error: undefined,
+          errorDetails: undefined,
+          attemptId,
+          startedAt: Date.now(),
         },
       }));
 
@@ -799,15 +1172,36 @@ useEffect(() => {
         }
       } catch (error) {
         const message = normalizeError(error);
-        setImports((prev) => ({
-          ...prev,
-          [slot]: {
-            ...prev[slot],
-            stage: "error",
-            message: "Import failed",
-            error: message,
-          },
-        }));
+        setImports((prev) => {
+          const previous = prev[slot];
+          if (previous.stage === "error") {
+            return prev;
+          }
+          const now = Date.now();
+          return {
+            ...prev,
+            [slot]: {
+              ...previous,
+              stage: "error",
+              message: message || "Import failed",
+              error: message,
+              errorDetails: message ? [message] : undefined,
+              history: [
+                {
+                  id: previous.attemptId ?? `${slot}-${now}`,
+                  fileName: previous.fileName,
+                  finishedAt: now,
+                  status: "error" as const,
+                  summary: message || "Import failed",
+                  details: message ? [message] : undefined,
+                },
+                ...previous.history,
+              ].slice(0, 5),
+              attemptId: undefined,
+              startedAt: undefined,
+            },
+          };
+        });
       }
     },
     [activeProjectId, selectedFiles],
@@ -817,6 +1211,23 @@ useEffect(() => {
     const stage = imports[slot].stage;
     return !["idle", "complete", "error"].includes(stage);
   };
+
+  const failedSlots = useMemo(
+    () => listSlots.filter((slot) => imports[slot].stage === "error"),
+    [imports],
+  );
+
+  const activeRefreshJob = useMemo(
+    () => refreshQueue.find((job) => job.status === "running") ?? null,
+    [refreshQueue],
+  );
+  const hasFinishedRefreshJobs = useMemo(
+    () =>
+      refreshQueue.some((job) =>
+        ["complete", "cancelled", "error"].includes(job.status),
+      ),
+    [refreshQueue],
+  );
 
   const applySettingsPatch = useCallback(
     async (patch: { telemetryEnabled?: boolean; placesRateLimitQps?: number }) => {
@@ -1111,18 +1522,99 @@ useEffect(() => {
         </div>
         {projectError && <p className="error-text">{projectError}</p>}
         <div className="comparison-actions">
-          <p className="muted">
-            Pending lookups · List A: {comparison?.stats.pending_a ?? 0} · List B:{" "}
-            {comparison?.stats.pending_b ?? 0}
-          </p>
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() => refreshPlaces()}
-            disabled={isRefreshingPlaces || !activeProjectId}
-          >
-            {isRefreshingPlaces ? "Refreshing Places…" : "Refresh details"}
-          </button>
+          <div>
+            <p className="muted">
+              Pending lookups · List A: {comparison?.stats.pending_a ?? 0} · List B:{" "}
+              {comparison?.stats.pending_b ?? 0}
+            </p>
+            <p className="muted">Rate limit: {rateLimitValue} QPS</p>
+          </div>
+          <div className="refresh-controls">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => enqueueRefresh()}
+              disabled={!activeProjectId}
+            >
+              Queue both lists
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => enqueueRefresh("A")}
+              disabled={!activeProjectId}
+            >
+              Queue List A
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => enqueueRefresh("B")}
+              disabled={!activeProjectId}
+            >
+              Queue List B
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={toggleRefreshPause}
+              disabled={!refreshQueue.length}
+            >
+              {isRefreshPaused ? "Resume queue" : "Pause queue"}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={cancelActiveRefresh}
+              disabled={!activeRefreshJob}
+            >
+              Cancel active
+            </button>
+          </div>
+        </div>
+        {refreshError && <p className="error-text">{refreshError}</p>}
+        <div className="refresh-queue">
+          {refreshQueue.length === 0 ? (
+            <p className="muted">No refresh jobs queued.</p>
+          ) : (
+            <ul>
+              {refreshQueue.map((job) => {
+                const total = job.total || 0;
+                const progressPct =
+                  total > 0 ? Math.min(100, Math.round((job.processed / total) * 100)) : 0;
+                return (
+                  <li key={job.id} className="refresh-job">
+                    <div className="refresh-job__header">
+                      <strong>{job.slot === "A" ? "List A" : "List B"}</strong>
+                      <span className={`refresh-status status-${job.status}`}>
+                        {job.status}
+                      </span>
+                    </div>
+                    <p className="refresh-job__message">{job.message}</p>
+                    <div className="progress-track">
+                      <div
+                        className="progress-bar"
+                        style={{ width: `${progressPct}%` }}
+                      />
+                    </div>
+                    <p className="refresh-job__metrics">
+                      {job.processed}/{total || "?"} rows processed · Resolved {job.resolved} ·
+                      Pending {job.pending}
+                    </p>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {hasFinishedRefreshJobs && (
+            <button
+              type="button"
+              className="link-button"
+              onClick={clearFinishedRefreshJobs}
+            >
+              Clear finished jobs
+            </button>
+          )}
         </div>
         {comparisonError && <p className="error-text">{comparisonError}</p>}
         {isLoadingComparison && <p className="muted">Loading comparison snapshot…</p>}
@@ -1161,6 +1653,7 @@ useEffect(() => {
                     totalCount={totalCounts[segment]}
                     filters={filters[segment]}
                     availableTypes={typeOptions[segment]}
+                    availableCategories={categoryOptions[segment]}
                     selectedIds={selections[segment]}
                     focusedPlaceId={focusedPlaceId}
                     onFiltersChange={handleFiltersChange}
@@ -1268,7 +1761,7 @@ useEffect(() => {
                   <button
                     type="button"
                     className="link-button"
-                    onClick={() => open(deviceFlow.verification_url)}
+                    onClick={() => openUrl(deviceFlow.verification_url)}
                   >
                     google.com/device
                   </button>{" "}
@@ -1314,55 +1807,133 @@ useEffect(() => {
             {!identity && <p>Sign in to browse Google Drive KML exports.</p>}
             {pickerError && <p className="error-text">{pickerError}</p>}
             {identity && (
-              <div className="list-grid">
-                {listSlots.map((slot) => (
-                  <div key={slot} className="list-card">
-                    <div className="list-card__header">
-                      <h3>List {slot}</h3>
-                      <span className="list-card__count">
-                        {driveFiles.length} file{driveFiles.length === 1 ? "" : "s"}
-                      </span>
+              <>
+                <div className="list-toolbar">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() =>
+                      failedSlots.forEach((slot) => {
+                        void handleImport(slot);
+                      })
+                    }
+                    disabled={
+                      failedSlots.length === 0 || failedSlots.some((slot) => slotBusy(slot))
+                    }
+                  >
+                    Retry failed imports
+                  </button>
+                  <p className="muted">
+                    {failedSlots.length === 0
+                      ? "No failed imports at the moment."
+                      : `${failedSlots.length} list${
+                          failedSlots.length === 1 ? "" : "s"
+                        } ready for retry.`}
+                  </p>
+                </div>
+                <div className="list-grid">
+                  {listSlots.map((slot) => (
+                    <div key={slot} className="list-card">
+                      <div className="list-card__header">
+                        <h3>List {slot}</h3>
+                        <span className="list-card__count">
+                          {driveFiles.length} file{driveFiles.length === 1 ? "" : "s"}
+                        </span>
+                      </div>
+                      <label className="field-label" htmlFor={`slot-${slot}`}>
+                        Drive KML
+                      </label>
+                      <select
+                        id={`slot-${slot}`}
+                        value={selectedFiles[slot]?.id ?? ""}
+                        onChange={(event) => handleFileSelection(slot, event.target.value)}
+                        disabled={driveFiles.length === 0 || isLoadingFiles}
+                      >
+                        <option value="">Select a file</option>
+                        {driveFiles.map((file) => (
+                          <option key={`${slot}-${file.id}`} value={file.id}>
+                            {file.name}
+                            {file.modified_time
+                              ? ` (${new Date(file.modified_time).toLocaleDateString()})`
+                              : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() => void handleImport(slot)}
+                        disabled={!selectedFiles[slot] || slotBusy(slot) || !activeProjectId}
+                      >
+                        {slotBusy(slot) ? "Importing…" : `Import to List ${slot}`}
+                      </button>
+                      <div className="progress-track">
+                        <div
+                          className="progress-bar"
+                          style={{ width: `${Math.round(imports[slot].progress * 100)}%` }}
+                        />
+                      </div>
+                      <p className="progress-copy">{imports[slot].message}</p>
+                      {imports[slot].error && (
+                        <div className="import-error">
+                          <p className="error-text">{imports[slot].error}</p>
+                          {imports[slot].errorDetails &&
+                            imports[slot].errorDetails.length > 0 && (
+                              <details className="import-details">
+                                <summary>Details</summary>
+                                <ul>
+                                  {imports[slot].errorDetails.map((detail, index) => (
+                                    <li key={`${slot}-detail-${index}`}>{detail}</li>
+                                  ))}
+                                </ul>
+                              </details>
+                            )}
+                          <div className="import-error__actions">
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              onClick={() => void handleImport(slot)}
+                              disabled={slotBusy(slot)}
+                            >
+                              Retry this file
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {imports[slot].history.length > 0 && (
+                        <details className="import-history">
+                          <summary>Recent attempts</summary>
+                          <ul>
+                            {imports[slot].history.map((attempt) => (
+                              <li key={attempt.id}>
+                                <div className="import-history__meta">
+                                  <strong>{attempt.fileName ?? "Unnamed file"}</strong>
+                                  <span>
+                                    {attempt.status === "success" ? "Succeeded" : "Failed"} ·{" "}
+                                    {new Date(attempt.finishedAt).toLocaleString(undefined, {
+                                      hour: "2-digit",
+                                      minute: "2-digit",
+                                      month: "short",
+                                      day: "numeric",
+                                    })}
+                                  </span>
+                                </div>
+                                {attempt.details && attempt.details.length > 0 && (
+                                  <ul className="import-history__details">
+                                    {attempt.details.map((detail, index) => (
+                                      <li key={`${attempt.id}-detail-${index}`}>{detail}</li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      )}
                     </div>
-                    <label className="field-label" htmlFor={`slot-${slot}`}>
-                      Drive KML
-                    </label>
-                    <select
-                      id={`slot-${slot}`}
-                      value={selectedFiles[slot]?.id ?? ""}
-                      onChange={(event) => handleFileSelection(slot, event.target.value)}
-                      disabled={driveFiles.length === 0 || isLoadingFiles}
-                    >
-                      <option value="">Select a file</option>
-                      {driveFiles.map((file) => (
-                        <option key={`${slot}-${file.id}`} value={file.id}>
-                          {file.name}
-                          {file.modified_time
-                            ? ` (${new Date(file.modified_time).toLocaleDateString()})`
-                            : ""}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className="primary-button"
-                      onClick={() => handleImport(slot)}
-                      disabled={!selectedFiles[slot] || slotBusy(slot) || !activeProjectId}
-                    >
-                      {slotBusy(slot) ? "Importing…" : `Import to List ${slot}`}
-                    </button>
-                    <div className="progress-track">
-                      <div
-                        className="progress-bar"
-                        style={{ width: `${Math.round(imports[slot].progress * 100)}%` }}
-                      />
-                    </div>
-                    <p className="progress-copy">{imports[slot].message}</p>
-                    {imports[slot].error && (
-                      <p className="error-text">{imports[slot].error}</p>
-                    )}
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              </>
             )}
           </article>
         </div>

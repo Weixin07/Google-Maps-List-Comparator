@@ -129,14 +129,24 @@ pub async fn refresh_place_details(
     state: tauri::State<'_, AppState>,
     project_id: Option<i64>,
     slot: Option<String>,
+    request_id: Option<String>,
 ) -> Result<Vec<NormalizationStats>, String> {
     let parsed = match slot {
         Some(value) => Some(vec![ListSlot::parse(&value).map_err(|err| err.to_string())?]),
         None => None,
     };
     state
-        .refresh_place_details(project_id, parsed)
+        .refresh_place_details(project_id, parsed, request_id)
         .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_refresh_queue(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .cancel_refresh_queue()
         .map_err(|err| err.to_string())
 }
 

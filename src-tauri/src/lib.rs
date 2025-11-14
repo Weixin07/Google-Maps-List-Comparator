@@ -14,11 +14,13 @@ mod telemetry;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use csv::WriterBuilder;
+use reqwest::StatusCode;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use rusqlite::Connection as SqlConnection;
@@ -33,7 +35,7 @@ use crate::commands::FoundationHealth;
 use crate::comparison::{ComparisonSegment, ComparisonSnapshot, PlaceComparisonRow};
 use crate::db::{DatabaseBootstrap, DatabaseContext, DB_KEY_ALIAS};
 use crate::errors::{AppError, AppResult};
-use crate::places::{NormalizationStats, PlaceNormalizer};
+use crate::places::{NormalizationProgress, NormalizationStats, PlaceNormalizer};
 use crate::projects::ComparisonProjectRecord;
 use crate::secrets::SecretLifecycle;
 use crate::settings::{RuntimeSettings, UpdateRuntimeSettingsPayload, UserSettings};
@@ -57,6 +59,7 @@ pub struct ImportProgressPayload {
     pub progress: f32,
     pub file_name: Option<String>,
     pub error: Option<String>,
+    pub details: Option<Vec<String>>,
 }
 
 impl ImportProgressPayload {
@@ -74,19 +77,40 @@ impl ImportProgressPayload {
             progress: progress.clamp(0.0, 1.0),
             file_name,
             error: None,
+            details: None,
         }
     }
 
-    fn error(slot: ListSlot, file_name: Option<String>, message: impl Into<String>) -> Self {
+    fn error(
+        slot: ListSlot,
+        file_name: Option<String>,
+        message: impl Into<String>,
+        details: Option<Vec<String>>,
+    ) -> Self {
+        let summary = message.into();
         Self {
             slot: slot.as_tag().to_string(),
             stage: "error".into(),
-            message: "Import failed".into(),
+            message: summary.clone(),
             progress: 0.0,
             file_name,
-            error: Some(message.into()),
+            error: Some(summary),
+            details,
         }
     }
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct RefreshProgressPayload {
+    pub slot: String,
+    pub request_id: Option<String>,
+    pub stage: String,
+    pub processed: usize,
+    pub total_rows: usize,
+    pub resolved: usize,
+    pub pending: usize,
+    pub rate_limit_qps: u32,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -117,6 +141,7 @@ pub struct AppState {
     db_key_lifecycle: SecretLifecycle,
     google: Option<GoogleServices>,
     places: PlaceNormalizer,
+    refresh_cancel_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl AppState {
@@ -186,6 +211,7 @@ impl AppState {
             db_key_lifecycle: key_lifecycle,
             google,
             places,
+            refresh_cancel_token: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -385,17 +411,49 @@ impl AppState {
         file_name: String,
     ) -> AppResult<ImportSummary> {
         let resolved_project = self.resolve_project_id(project_id)?;
+        let file_hash = fingerprint(&file_id);
         match self
-            .import_drive_file_inner(resolved_project, slot, file_id, file_name.clone())
+            .import_drive_file_inner(
+                resolved_project,
+                slot,
+                file_id,
+                file_name.clone(),
+                file_hash.clone(),
+            )
             .await
         {
             Ok(summary) => Ok(summary),
             Err(err) => {
+                let (summary, details) = describe_import_error(&err);
+                let detail_payload = if details.is_empty() {
+                    None
+                } else {
+                    Some(details.clone())
+                };
                 self.notify_progress(ImportProgressPayload::error(
                     slot,
                     Some(file_name),
-                    err.to_string(),
+                    summary.clone(),
+                    detail_payload,
                 ));
+                if let Err(telemetry_err) = self.telemetry.record(
+                    "import_failed",
+                    json!({
+                        "slot": slot.as_tag(),
+                        "file_hash": file_hash.clone(),
+                        "summary": summary.clone(),
+                        "detail_count": details.len(),
+                    }),
+                ) {
+                    warn!(?telemetry_err, "failed to record import_failed telemetry");
+                }
+                warn!(
+                    slot = slot.as_tag(),
+                    file_hash,
+                    summary = summary.as_str(),
+                    detail_count = details.len(),
+                    "drive import failed"
+                );
                 Err(err)
             }
         }
@@ -416,10 +474,107 @@ impl AppState {
         &self,
         project_id: Option<i64>,
         slots: Option<Vec<ListSlot>>,
+        request_id: Option<String>,
     ) -> AppResult<Vec<NormalizationStats>> {
         let resolved_project = self.resolve_project_id(project_id)?;
         let targets = slots.unwrap_or_else(|| vec![ListSlot::A, ListSlot::B]);
-        self.places.refresh_slots(resolved_project, &targets).await
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = self.refresh_cancel_token.lock();
+            *guard = Some(cancel_flag.clone());
+        }
+        let rate_limit = self.places.rate_limit_qps();
+        let handle = self.handle.clone();
+        let request_token = request_id.clone();
+        let notifier = Arc::new(move |progress: NormalizationProgress| {
+            let payload = RefreshProgressPayload {
+                slot: progress.slot.as_tag().to_string(),
+                request_id: request_token.clone(),
+                stage: "running".into(),
+                processed: progress.processed,
+                total_rows: progress.total_rows,
+                resolved: progress.resolved,
+                pending: progress.total_rows.saturating_sub(progress.processed),
+                rate_limit_qps: rate_limit,
+                message: format!(
+                    "Refreshing {} ({}/{})",
+                    progress.slot.display_name(),
+                    progress.processed,
+                    progress.total_rows
+                ),
+            };
+            if let Err(err) = handle.emit("refresh://progress", payload) {
+                warn!(?err, "failed to emit refresh progress");
+            }
+        });
+        let result = self
+            .places
+            .refresh_slots(
+                resolved_project,
+                &targets,
+                Some(notifier),
+                Some(cancel_flag.clone()),
+            )
+            .await;
+        {
+            let mut guard = self.refresh_cancel_token.lock();
+            guard.take();
+        }
+        match result {
+            Ok(stats) => {
+                let cancelled = cancel_flag.load(AtomicOrdering::SeqCst);
+                for entry in &stats {
+                    let stage = if cancelled && entry.unresolved > 0 {
+                        "cancelled"
+                    } else {
+                        "complete"
+                    };
+                    self.notify_refresh_progress(RefreshProgressPayload {
+                        slot: entry.slot.as_tag().to_string(),
+                        request_id: request_id.clone(),
+                        stage: stage.into(),
+                        processed: entry.total_rows.saturating_sub(entry.unresolved),
+                        total_rows: entry.total_rows,
+                        resolved: entry.resolved,
+                        pending: entry.unresolved,
+                        rate_limit_qps: rate_limit,
+                        message: if stage == "complete" {
+                            format!(
+                                "Refreshed {} places for {}",
+                                entry.resolved,
+                                entry.slot.display_name()
+                            )
+                        } else {
+                            format!(
+                                "Cancelled refresh with {} places remaining for {}",
+                                entry.unresolved,
+                                entry.slot.display_name()
+                            )
+                        },
+                    });
+                }
+                Ok(stats)
+            }
+            Err(err) => {
+                self.notify_refresh_progress(RefreshProgressPayload {
+                    slot: targets
+                        .first()
+                        .copied()
+                        .unwrap_or(ListSlot::A)
+                        .as_tag()
+                        .to_string(),
+                    request_id,
+                    stage: "error".into(),
+                    processed: 0,
+                    total_rows: 0,
+                    resolved: 0,
+                    pending: 0,
+                    rate_limit_qps: rate_limit,
+                    message: sanitize_error_copy(&err.to_string()),
+                });
+                Err(err)
+            }
+        }
     }
 
     async fn import_drive_file_inner(
@@ -428,8 +583,8 @@ impl AppState {
         slot: ListSlot,
         file_id: String,
         file_name: String,
+        file_hash: String,
     ) -> AppResult<ImportSummary> {
-        let file_hash = fingerprint(&file_id);
         if let Err(err) = self.telemetry.record(
             "drive_file_selected",
             json!({
@@ -513,7 +668,10 @@ impl AppState {
             Some(file_name.clone()),
         ));
 
-        let normalization = self.places.normalize_slot(project_id, slot).await?;
+        let normalization = self
+            .places
+            .normalize_slot(project_id, slot, None, None)
+            .await?;
 
         self.notify_progress(ImportProgressPayload::new(
             slot,
@@ -544,6 +702,12 @@ impl AppState {
     fn notify_progress(&self, payload: ImportProgressPayload) {
         if let Err(err) = self.handle.emit("import://progress", payload) {
             warn!(?err, "failed to emit import progress");
+        }
+    }
+
+    fn notify_refresh_progress(&self, payload: RefreshProgressPayload) {
+        if let Err(err) = self.handle.emit("refresh://progress", payload) {
+            warn!(?err, "failed to emit refresh progress");
         }
     }
 
@@ -578,6 +742,13 @@ impl AppState {
             }
         }
         Ok(self.runtime_settings())
+    }
+
+    pub fn cancel_refresh_queue(&self) -> AppResult<()> {
+        if let Some(flag) = self.refresh_cancel_token.lock().clone() {
+            flag.store(true, AtomicOrdering::SeqCst);
+        }
+        Ok(())
     }
 }
 
@@ -660,10 +831,103 @@ impl ExportFormat {
     }
 }
 
+fn describe_import_error(err: &AppError) -> (String, Vec<String>) {
+    match err {
+        AppError::Http(http_err) => {
+            let mut details = Vec::new();
+            if let Some(status) = http_err.status() {
+                details.push(format!("HTTP status: {}", status));
+            }
+            if http_err.is_timeout() {
+                details.push("The request timed out before Drive responded.".into());
+                return ("Google Drive request timed out".into(), details);
+            }
+            if http_err.is_connect() {
+                details.push("The client could not reach the Google Drive endpoint.".into());
+                return ("Unable to reach Google Drive".into(), details);
+            }
+            if matches!(http_err.status(), Some(StatusCode::TOO_MANY_REQUESTS)) {
+                details.push("Drive returned 429 Too Many Requests.".into());
+                return ("Google Drive rate limit was hit".into(), details);
+            }
+            if let Some(url) = http_err.url() {
+                if let Some(host) = url.host_str() {
+                    details.push(format!("Endpoint host: {}", host));
+                }
+            }
+            details.push(format!(
+                "Transport: {}",
+                sanitize_error_copy(&http_err.to_string())
+            ));
+            ("Google Drive request failed".into(), details)
+        }
+        AppError::Parse(reason) => (
+            "KML parsing failed".into(),
+            vec![format!("Parser: {}", sanitize_error_copy(reason))],
+        ),
+        AppError::Json(reason) => (
+            "Unable to process Drive response".into(),
+            vec![format!("JSON error: {}", sanitize_error_copy(&reason.to_string()))],
+        ),
+        AppError::Io(io_err) => (
+            "Failed to persist Drive data locally".into(),
+            vec![format!("I/O error: {}", sanitize_error_copy(&io_err.to_string()))],
+        ),
+        AppError::Database(db_err) => (
+            "Database write failed during import".into(),
+            vec![format!(
+                "SQLite error: {}",
+                sanitize_error_copy(&db_err.to_string())
+            )],
+        ),
+        AppError::Config(message) => (
+            "Import is not configured correctly".into(),
+            vec![sanitize_error_copy(message)],
+        ),
+        AppError::Keychain(err) => (
+            "Secure storage was not accessible".into(),
+            vec![format!("Keychain: {}", sanitize_error_copy(&err.to_string()))],
+        ),
+        _ => (
+            "Unexpected import failure".into(),
+            vec![sanitize_error_copy(&err.to_string())],
+        ),
+    }
+}
+
 fn fingerprint(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     STANDARD_NO_PAD.encode(hasher.finalize())
+}
+
+fn sanitize_error_copy(raw: &str) -> String {
+    let mut sanitized = redact_segment(raw, "/files/", &['/', '?', '&', ' ']);
+    sanitized = redact_segment(&sanitized, "fileId=", &['&', ' ']);
+    sanitized = redact_segment(&sanitized, "driveId=", &['&', ' ']);
+    sanitized = redact_segment(&sanitized, "resourceKey=", &['&', ' ']);
+    sanitized
+}
+
+fn redact_segment(value: &str, needle: &str, terminators: &[char]) -> String {
+    if !value.contains(needle) {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(value.len());
+    let mut start = 0;
+    while let Some(relative) = value[start..].find(needle) {
+        let idx = start + relative;
+        let head_end = idx + needle.len();
+        result.push_str(&value[start..head_end]);
+        let tail = &value[head_end..];
+        let stop = tail
+            .find(|c: char| terminators.contains(&c))
+            .unwrap_or_else(|| tail.len());
+        result.push_str("<redacted>");
+        start = head_end + stop;
+    }
+    result.push_str(&value[start..]);
+    result
 }
 
 fn init_tracing() {
@@ -697,6 +961,7 @@ pub fn run() {
             commands::drive_list_kml_files,
             commands::drive_import_kml,
             commands::refresh_place_details,
+            commands::cancel_refresh_queue,
             commands::compare_lists,
             commands::list_comparison_projects,
             commands::create_comparison_project,

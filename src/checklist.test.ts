@@ -33,6 +33,8 @@ const baseHealth: FoundationHealth = {
     database_file_name: "test.db",
     has_google_places_key: false,
     has_maptiler_key: false,
+    drive_import_enabled: true,
+    drive_picker_page_size: 10,
   },
 };
 

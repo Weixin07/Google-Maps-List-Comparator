@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +62,14 @@ impl NormalizationStats {
 struct NormalizationResult {
     source: ResolutionSource,
     details: PlaceDetails,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizationProgress {
+    pub slot: ListSlot,
+    pub total_rows: usize,
+    pub processed: usize,
+    pub resolved: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,10 +141,16 @@ impl PlaceNormalizer {
         self.rate_limiter.set_qps(qps.max(1));
     }
 
+    pub fn rate_limit_qps(&self) -> u32 {
+        self.rate_limiter.qps()
+    }
+
     pub async fn normalize_slot(
         &self,
         project_id: i64,
         slot: ListSlot,
+        observer: Option<Arc<dyn Fn(NormalizationProgress) + Send + Sync>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
     ) -> AppResult<NormalizationStats> {
         let _lock = self.guard.lock().await;
         let Some((list_id, rows)) = self.load_rows(project_id, slot)? else {
@@ -150,7 +164,14 @@ impl PlaceNormalizer {
         self.clear_assignments(list_id)?;
 
         let mut stats = NormalizationStats::with_total(slot, rows.len());
+        let total_rows = rows.len();
+        let mut processed = 0;
         for entry in rows {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
             match self.normalize_row(&entry).await {
                 Ok(Some(result)) => {
                     if matches!(
@@ -173,6 +194,21 @@ impl PlaceNormalizer {
                     stats.unresolved += 1;
                 }
             }
+            processed += 1;
+            if let Some(callback) = &observer {
+                callback(NormalizationProgress {
+                    slot,
+                    total_rows,
+                    processed,
+                    resolved: stats.resolved,
+                });
+            }
+        }
+
+        if let Some(flag) = &cancel_flag {
+            if flag.load(Ordering::SeqCst) && processed < total_rows {
+                stats.unresolved += total_rows - processed;
+            }
         }
 
         Ok(stats)
@@ -182,10 +218,20 @@ impl PlaceNormalizer {
         &self,
         project_id: i64,
         slots: &[ListSlot],
+        observer: Option<Arc<dyn Fn(NormalizationProgress) + Send + Sync>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
     ) -> AppResult<Vec<NormalizationStats>> {
         let mut results = Vec::new();
         for slot in slots {
-            results.push(self.normalize_slot(project_id, *slot).await?);
+            results.push(
+                self.normalize_slot(
+                    project_id,
+                    *slot,
+                    observer.clone(),
+                    cancel_flag.clone(),
+                )
+                .await?,
+            );
         }
         Ok(results)
     }
@@ -497,6 +543,12 @@ impl RateLimiter {
     fn set_qps(&self, qps: u32) {
         self.min_interval_ms
             .store(Self::interval_ms(qps), Ordering::SeqCst);
+    }
+
+    fn qps(&self) -> u32 {
+        let interval = self.min_interval_ms.load(Ordering::SeqCst).max(1);
+        let qps = (1000_f64 / interval as f64).round() as u32;
+        qps.max(1)
     }
 
     fn interval_ms(qps: u32) -> u64 {
@@ -811,7 +863,7 @@ mod tests {
         );
 
         let stats = normalizer
-            .normalize_slot(project_id, ListSlot::A)
+            .normalize_slot(project_id, ListSlot::A, None, None)
             .await
             .unwrap();
         assert_eq!(stats.cache_hits, 1);
@@ -877,7 +929,7 @@ mod tests {
         );
 
         let stats = normalizer
-            .normalize_slot(project_id, ListSlot::A)
+            .normalize_slot(project_id, ListSlot::A, None, None)
             .await
             .unwrap();
         assert_eq!(stats.cache_hits, 0);
