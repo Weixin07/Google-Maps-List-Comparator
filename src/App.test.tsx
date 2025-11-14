@@ -13,6 +13,11 @@ vi.mock("@tauri-apps/api/core", () => ({
           has_encryption_key: true,
           db_bootstrap_recovered: false,
           db_key_lifecycle: "created",
+          settings: {
+            telemetry_enabled: true,
+            places_rate_limit_qps: 3,
+            telemetry_salt: "salt",
+          },
           config: {
             telemetry_endpoint: null,
             telemetry_enabled_by_default: true,

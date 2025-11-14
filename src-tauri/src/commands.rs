@@ -8,6 +8,7 @@ use crate::google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity};
 use crate::ingestion::{ImportSummary, ListSlot};
 use crate::places::NormalizationStats;
 use crate::projects::ComparisonProjectRecord;
+use crate::settings::{RuntimeSettings, UpdateRuntimeSettingsPayload};
 use crate::{AppState, ExportSummary, MapStyleDescriptor};
 
 #[derive(Debug, Serialize)]
@@ -19,6 +20,7 @@ pub struct FoundationHealth {
     pub config: PublicAppConfig,
     pub db_bootstrap_recovered: bool,
     pub db_key_lifecycle: String,
+    pub settings: RuntimeSettings,
 }
 
 impl FoundationHealth {
@@ -30,6 +32,7 @@ impl FoundationHealth {
         config: PublicAppConfig,
         db_bootstrap_recovered: bool,
         db_key_lifecycle: String,
+        settings: RuntimeSettings,
     ) -> Self {
         Self {
             db_path,
@@ -39,6 +42,7 @@ impl FoundationHealth {
             config,
             db_bootstrap_recovered,
             db_key_lifecycle,
+            settings,
         }
     }
 }
@@ -59,6 +63,16 @@ pub async fn record_telemetry_event(
 ) -> Result<(), String> {
     state
         .record_telemetry_event(name, payload, flush.unwrap_or(false))
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn update_runtime_settings(
+    state: tauri::State<'_, AppState>,
+    payload: UpdateRuntimeSettingsPayload,
+) -> Result<RuntimeSettings, String> {
+    state
+        .update_runtime_settings(payload)
         .map_err(|err| err.to_string())
 }
 

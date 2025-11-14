@@ -59,6 +59,7 @@ export function ComparisonMap({
       features,
     };
   }, [data, selectedIds]);
+  const geojsonRef = useRef(geojson);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -76,8 +77,13 @@ export function ComparisonMap({
     map.on("load", () => {
       map.addSource("comparison-places", {
         type: "geojson",
-        data: geojson,
+        data: {
+          type: "FeatureCollection",
+          features: [],
+        },
       });
+      const baseSource = map.getSource("comparison-places") as GeoJSONSource | undefined;
+      baseSource?.setData(geojsonRef.current);
       (Object.keys(layerColors) as ComparisonSegmentKey[]).forEach(
         (segment) => {
           map.addLayer({
@@ -136,14 +142,13 @@ export function ComparisonMap({
   }, [onMarkerFocus, styleUrl]);
 
   useEffect(() => {
+    geojsonRef.current = geojson;
     const map = mapRef.current;
     if (!map) {
       return;
     }
     const source = map.getSource("comparison-places") as GeoJSONSource | undefined;
-    if (source) {
-      source.setData(geojson);
-    }
+    source?.setData(geojson);
   }, [geojson]);
 
   useEffect(() => {

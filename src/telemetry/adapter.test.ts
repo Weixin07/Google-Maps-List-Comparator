@@ -16,6 +16,7 @@ describe("TelemetryAdapter", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("skips tracking when disabled", async () => {
@@ -94,6 +95,40 @@ describe("TelemetryAdapter", () => {
     vi.advanceTimersByTime(1000);
     await flushMicrotasks();
     expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    adapter.dispose();
+  });
+
+  it("uploads via fetch when an endpoint is configured", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    const adapter = new TelemetryAdapter({
+      flushSize: 1,
+      flushIntervalMs: 0,
+      enabled: true,
+    });
+    adapter.configureUpload({
+      endpoint: "https://example.test/capture",
+      distinctId: "salt",
+      source: "test",
+    });
+    adapter.track("ui_boot");
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(mockedInvoke).not.toHaveBeenCalled();
+    adapter.dispose();
+  });
+
+  it("hashes place identifiers with the install salt", async () => {
+    const adapter = new TelemetryAdapter({
+      flushSize: 1,
+      flushIntervalMs: 0,
+      enabled: true,
+    });
+    adapter.setInstallSalt("demo-salt");
+    const hash = await adapter.hashPlaceId("ChIJN1t_tDeuEmsRUsoyG83frY4");
+    const second = await adapter.hashPlaceId("ChIJN1t_tDeuEmsRUsoyG83frY4");
+    expect(hash).toEqual(second);
+    expect(hash).not.toContain("ChIJN1t_tDeuEmsRUsoyG83frY4");
     adapter.dispose();
   });
 });

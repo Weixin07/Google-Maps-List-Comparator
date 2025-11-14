@@ -47,7 +47,10 @@ pub fn list_projects(connection: &Connection) -> AppResult<Vec<ComparisonProject
     Ok(rows)
 }
 
-pub fn project_by_id(connection: &Connection, project_id: i64) -> AppResult<ComparisonProjectRecord> {
+pub fn project_by_id(
+    connection: &Connection,
+    project_id: i64,
+) -> AppResult<ComparisonProjectRecord> {
     connection
         .query_row(
             "SELECT

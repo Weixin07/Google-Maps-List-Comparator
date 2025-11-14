@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,7 +129,15 @@ impl PlaceNormalizer {
         }
     }
 
-    pub async fn normalize_slot(&self, project_id: i64, slot: ListSlot) -> AppResult<NormalizationStats> {
+    pub fn set_rate_limit(&self, qps: u32) {
+        self.rate_limiter.set_qps(qps.max(1));
+    }
+
+    pub async fn normalize_slot(
+        &self,
+        project_id: i64,
+        slot: ListSlot,
+    ) -> AppResult<NormalizationStats> {
         let _lock = self.guard.lock().await;
         let Some((list_id, rows)) = self.load_rows(project_id, slot)? else {
             return Ok(NormalizationStats::empty(slot));
@@ -473,25 +482,40 @@ pub trait PlaceLookup: Send + Sync {
 }
 
 struct RateLimiter {
-    min_interval: Duration,
+    min_interval_ms: AtomicU64,
     last_tick: AsyncMutex<Option<Instant>>,
 }
 
 impl RateLimiter {
     fn new(qps: u32) -> Self {
-        let interval_ms = (1000_f64 / qps as f64).ceil() as u64;
         Self {
-            min_interval: Duration::from_millis(interval_ms.max(50)),
+            min_interval_ms: AtomicU64::new(Self::interval_ms(qps)),
             last_tick: AsyncMutex::new(None),
         }
     }
 
+    fn set_qps(&self, qps: u32) {
+        self.min_interval_ms
+            .store(Self::interval_ms(qps), Ordering::SeqCst);
+    }
+
+    fn interval_ms(qps: u32) -> u64 {
+        let safe_qps = qps.max(1);
+        let interval_ms = (1000_f64 / safe_qps as f64).ceil() as u64;
+        interval_ms.max(50)
+    }
+
+    fn interval_duration(&self) -> Duration {
+        Duration::from_millis(self.min_interval_ms.load(Ordering::SeqCst))
+    }
+
     async fn wait(&self) {
+        let interval = self.interval_duration();
         let mut guard = self.last_tick.lock().await;
         if let Some(prev) = *guard {
             let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                sleep(self.min_interval - elapsed).await;
+            if elapsed < interval {
+                sleep(interval - elapsed).await;
             }
         }
         *guard = Some(Instant::now());
@@ -786,7 +810,10 @@ mod tests {
             rand::rngs::StdRng::seed_from_u64(1),
         );
 
-        let stats = normalizer.normalize_slot(project_id, ListSlot::A).await.unwrap();
+        let stats = normalizer
+            .normalize_slot(project_id, ListSlot::A)
+            .await
+            .unwrap();
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.places_calls, 0);
         assert_eq!(stats.resolved, 1);
@@ -849,7 +876,10 @@ mod tests {
             rand::rngs::StdRng::seed_from_u64(2),
         );
 
-        let stats = normalizer.normalize_slot(project_id, ListSlot::A).await.unwrap();
+        let stats = normalizer
+            .normalize_slot(project_id, ListSlot::A)
+            .await
+            .unwrap();
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(stats.places_calls, 1);
         assert_eq!(stats.resolved, 1);

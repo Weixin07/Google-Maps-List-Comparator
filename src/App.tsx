@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { open } from "@tauri-apps/plugin-opener";
-import type { FoundationHealth } from "./types/foundation";
+import type { FoundationHealth, RuntimeSettings } from "./types/foundation";
 import type {
   ComparisonProjectRecord,
   ComparisonSegmentKey,
@@ -173,6 +174,10 @@ function App() {
     A: defaultImportState,
     B: defaultImportState,
   });
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
+  const [pendingRateLimit, setPendingRateLimit] = useState<number | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [isUpdatingSettings, setIsUpdatingSettings] = useState(false);
   const [comparison, setComparison] = useState<ComparisonSnapshot | null>(null);
   const [comparisonError, setComparisonError] = useState<string | null>(null);
   const [isLoadingComparison, setIsLoadingComparison] = useState(false);
@@ -205,6 +210,11 @@ function App() {
     useState<ComparisonSegmentKey | null>(null);
   const mode = import.meta.env.DEV ? "DEV MODE" : "PRODUCTION BUILD";
   const isDevMode = import.meta.env.DEV;
+  const rateLimitValue =
+    pendingRateLimit ??
+    runtimeSettings?.places_rate_limit_qps ??
+    foundationHealth?.config.places_rate_limit_qps ??
+    1;
 
   const loadProjects = useCallback(async () => {
     setIsLoadingProjects(true);
@@ -347,19 +357,29 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (foundationHealth) {
-      telemetry.setEnabled(foundationHealth.config.telemetry_enabled_by_default);
-      telemetry.track(
-        "foundation_health_loaded",
-        {
-          queueDepth: foundationHealth.telemetry_queue_depth,
-          recovered: foundationHealth.db_bootstrap_recovered,
-        },
-        { flush: true },
-      );
-    }
-  }, [foundationHealth]);
+useEffect(() => {
+  if (!foundationHealth) {
+    setRuntimeSettings(null);
+    return;
+  }
+  setRuntimeSettings(foundationHealth.settings);
+  setPendingRateLimit(foundationHealth.settings.places_rate_limit_qps);
+  telemetry.setEnabled(foundationHealth.settings.telemetry_enabled);
+  telemetry.setInstallSalt(foundationHealth.settings.telemetry_salt);
+  telemetry.configureUpload({
+    endpoint: foundationHealth.config.telemetry_endpoint ?? undefined,
+    distinctId: foundationHealth.settings.telemetry_salt,
+  });
+  telemetry.track(
+    "foundation_health_loaded",
+    {
+      queueDepth: foundationHealth.telemetry_queue_depth,
+      recovered: foundationHealth.db_bootstrap_recovered,
+      telemetryEnabled: foundationHealth.settings.telemetry_enabled,
+    },
+    { flush: true },
+  );
+}, [foundationHealth]);
 
   useEffect(() => {
     if (activeProjectId) {
@@ -416,12 +436,24 @@ function App() {
     [],
   );
 
+  const emitPlaceFocus = useCallback((source: "table" | "map", placeId: string) => {
+    void telemetry
+      .hashPlaceId(placeId)
+      .then((placeHash) => {
+        telemetry.track("place_focus", { source, placeHash });
+      })
+      .catch(() => {
+        // intentionally ignore hashing failures to avoid blocking UI focus
+      });
+  }, []);
+
   const handleRowFocus = useCallback(
     (_segment: ComparisonSegmentKey, row: PlaceComparisonRow) => {
       setFocusedPlaceId(row.place_id);
       setFocusPoint({ lng: row.lng, lat: row.lat });
+      emitPlaceFocus("table", row.place_id);
     },
-    [],
+    [emitPlaceFocus],
   );
 
   const handleMarkerFocus = useCallback(
@@ -436,9 +468,10 @@ function App() {
       const match = allRows.find((row) => row.place_id === placeId);
       if (match) {
         setFocusPoint({ lng: match.lng, lat: match.lat });
+        emitPlaceFocus("map", placeId);
       }
     },
-    [comparison],
+    [comparison, emitPlaceFocus],
   );
 
   const handleLayerToggle = useCallback((segment: ComparisonSegmentKey) => {
@@ -785,6 +818,61 @@ function App() {
     return !["idle", "complete", "error"].includes(stage);
   };
 
+  const applySettingsPatch = useCallback(
+    async (patch: { telemetryEnabled?: boolean; placesRateLimitQps?: number }) => {
+      if (!runtimeSettings) {
+        return;
+      }
+      const payload: Record<string, unknown> = {};
+      if (typeof patch.telemetryEnabled === "boolean") {
+        payload.telemetryEnabled = patch.telemetryEnabled;
+      }
+      if (typeof patch.placesRateLimitQps === "number") {
+        payload.placesRateLimitQps = patch.placesRateLimitQps;
+      }
+      if (Object.keys(payload).length === 0) {
+        return;
+      }
+      setIsUpdatingSettings(true);
+      setSettingsError(null);
+      try {
+        const updated = await invoke<RuntimeSettings>("update_runtime_settings", {
+          payload,
+        });
+        setRuntimeSettings(updated);
+        setPendingRateLimit(updated.places_rate_limit_qps);
+        telemetry.setEnabled(updated.telemetry_enabled);
+      } catch (error) {
+        setSettingsError(normalizeError(error));
+      } finally {
+        setIsUpdatingSettings(false);
+      }
+    },
+    [runtimeSettings],
+  );
+
+  const handleTelemetryToggle = useCallback(() => {
+    if (!runtimeSettings) {
+      return;
+    }
+    void applySettingsPatch({ telemetryEnabled: !runtimeSettings.telemetry_enabled });
+  }, [applySettingsPatch, runtimeSettings]);
+
+  const handleRateLimitChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setPendingRateLimit(Number(event.target.value));
+  };
+
+  const handleRateLimitApply = useCallback(() => {
+    if (
+      !runtimeSettings ||
+      pendingRateLimit == null ||
+      pendingRateLimit === runtimeSettings.places_rate_limit_qps
+    ) {
+      return;
+    }
+    void applySettingsPatch({ placesRateLimitQps: pendingRateLimit });
+  }, [applySettingsPatch, pendingRateLimit, runtimeSettings]);
+
   return (
     <main className="app-shell">
       <header className="hero">
@@ -868,6 +956,110 @@ function App() {
         {bootstrapError && (
           <p className="error-text">Bootstrap error: {bootstrapError}</p>
         )}
+      </section>
+
+      <section className="settings-panel">
+        <div className="panel-header">
+          <h2>Settings</h2>
+          <p>Control telemetry and Places resolver budgets.</p>
+        </div>
+        {!foundationHealth && !bootstrapError && <p>Loading settings&hellip;</p>}
+        {foundationHealth && runtimeSettings && (
+          <div className="settings-grid">
+            <article className="settings-card">
+              <div className="settings-card__header">
+                <div>
+                  <h3>Telemetry</h3>
+                  <p className="muted">
+                    {foundationHealth.config.telemetry_endpoint
+                      ? "Events stream to the configured endpoint with offline buffering."
+                      : "Events stay on disk until you opt-in to an endpoint."}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className={`toggle ${runtimeSettings.telemetry_enabled ? "on" : "off"}`}
+                  onClick={handleTelemetryToggle}
+                  disabled={isUpdatingSettings}
+                >
+                  {runtimeSettings.telemetry_enabled ? "Enabled" : "Disabled"}
+                </button>
+              </div>
+              <dl className="settings-list">
+                <div>
+                  <dt>Endpoint</dt>
+                  <dd>
+                    {foundationHealth.config.telemetry_endpoint ?? "Offline buffer only"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Queue depth</dt>
+                  <dd>{foundationHealth.telemetry_queue_depth}</dd>
+                </div>
+                <div>
+                  <dt>Buffer path</dt>
+                  <dd>{foundationHealth.telemetry_buffer_path}</dd>
+                </div>
+              </dl>
+            </article>
+            <article className="settings-card">
+              <h3>Places rate limit</h3>
+              <p className="muted">
+                Protects the Google Places Search API quota shared across slots.
+              </p>
+              <input
+                type="range"
+                min={1}
+                max={10}
+                step={1}
+                className="rate-slider"
+                value={rateLimitValue}
+                onChange={handleRateLimitChange}
+                disabled={isUpdatingSettings}
+              />
+              <div className="rate-limit-meta">
+                <span>{rateLimitValue} req/sec</span>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={handleRateLimitApply}
+                  disabled={
+                    isUpdatingSettings ||
+                    rateLimitValue === runtimeSettings.places_rate_limit_qps
+                  }
+                >
+                  Update budget
+                </button>
+              </div>
+              <p className="muted">
+                Active normalizations honor this budget immediately; queued work is throttled.
+              </p>
+            </article>
+            <article className="settings-card">
+              <h3>SQLCipher passphrase</h3>
+              <p className="muted">Signals whether the OS keychain secret is intact.</p>
+              <dl className="settings-list">
+                <div>
+                  <dt>Lifecycle</dt>
+                  <dd>{foundationHealth.db_key_lifecycle}</dd>
+                </div>
+                <div>
+                  <dt>Recovered on last boot</dt>
+                  <dd>{foundationHealth.db_bootstrap_recovered ? "Yes" : "No"}</dd>
+                </div>
+                <div>
+                  <dt>Key in vault</dt>
+                  <dd>{foundationHealth.has_encryption_key ? "Present" : "Missing"}</dd>
+                </div>
+                <div>
+                  <dt>Database path</dt>
+                  <dd>{foundationHealth.db_path}</dd>
+                </div>
+              </dl>
+            </article>
+          </div>
+        )}
+        {settingsError && <p className="error-text">{settingsError}</p>}
       </section>
 
       <section className="comparison-panel">

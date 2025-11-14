@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-app",
+  "productName": "Google Maps List Comparator",
   "version": "0.1.0",
-  "identifier": "com.faith.tauri-app",
+  "identifier": "com.faith.google-maps-list-comparator",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,9 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-app",
-        "width": 800,
-        "height": 600
+        "title": "Google Maps List Comparator",
+        "width": 1200,
+        "height": 800,
+        "resizable": true
       }
     ],
     "security": {
@@ -30,6 +31,18 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": false
+      },
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "languages": ["en-US"]
+      }
+    }
   }
 }

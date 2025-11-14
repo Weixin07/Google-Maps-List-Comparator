@@ -222,12 +222,12 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
         "list_places",
         "assigned_at TEXT NOT NULL DEFAULT (DATETIME('now'))",
     )?;
-    ensure_column(connection, "lists", "project_id INTEGER REFERENCES comparison_projects(id)")?;
     ensure_column(
         connection,
         "lists",
-        "slot TEXT NOT NULL DEFAULT 'A'",
+        "project_id INTEGER REFERENCES comparison_projects(id)",
     )?;
+    ensure_column(connection, "lists", "slot TEXT NOT NULL DEFAULT 'A'")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_places_lat_lng ON places(lat, lng)",
         [],

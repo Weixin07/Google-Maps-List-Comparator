@@ -13,6 +13,12 @@ export type PublicAppConfig = {
   drive_picker_page_size: number;
 };
 
+export type RuntimeSettings = {
+  telemetry_enabled: boolean;
+  places_rate_limit_qps: number;
+  telemetry_salt: string;
+};
+
 export type FoundationHealth = {
   db_path: string;
   telemetry_buffer_path: string;
@@ -21,4 +27,5 @@ export type FoundationHealth = {
   db_bootstrap_recovered: boolean;
   db_key_lifecycle: string;
   config: PublicAppConfig;
+  settings: RuntimeSettings;
 };

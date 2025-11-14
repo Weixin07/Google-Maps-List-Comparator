@@ -5,9 +5,10 @@ mod db;
 mod errors;
 mod google;
 mod ingestion;
-mod projects;
 mod places;
+mod projects;
 mod secrets;
+mod settings;
 mod telemetry;
 
 use std::collections::HashSet;
@@ -15,9 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use csv::WriterBuilder;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
+use csv::WriterBuilder;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use rusqlite::Connection as SqlConnection;
@@ -33,9 +34,10 @@ use crate::comparison::{ComparisonSegment, ComparisonSnapshot, PlaceComparisonRo
 use crate::db::{DatabaseBootstrap, DatabaseContext, DB_KEY_ALIAS};
 use crate::errors::{AppError, AppResult};
 use crate::places::{NormalizationStats, PlaceNormalizer};
-use secrecy::ExposeSecret;
 use crate::projects::ComparisonProjectRecord;
 use crate::secrets::SecretLifecycle;
+use crate::settings::{RuntimeSettings, UpdateRuntimeSettingsPayload, UserSettings};
+use secrecy::ExposeSecret;
 
 const VAULT_SERVICE_NAME: &str = "GoogleMapsListComparator";
 
@@ -108,6 +110,8 @@ pub struct AppState {
     db_path: PathBuf,
     vault: SecretVault,
     config: AppConfig,
+    settings: Arc<Mutex<UserSettings>>,
+    settings_path: PathBuf,
     telemetry: TelemetryClient,
     db_bootstrap_recovered: bool,
     db_key_lifecycle: SecretLifecycle,
@@ -124,12 +128,15 @@ impl AppState {
         let handle = app.clone();
 
         std::fs::create_dir_all(&data_dir)?;
+        let settings_path = settings::settings_path(&data_dir);
+        let settings = UserSettings::load(&settings_path, &config)?;
         let DatabaseBootstrap {
             context: DatabaseContext { connection, path },
             key_lifecycle,
             recovered,
         } = bootstrap(&data_dir, &config.database_file_name, &vault)?;
         let telemetry = TelemetryClient::new(&data_dir, &config)?;
+        telemetry.set_enabled(settings.telemetry_enabled);
         let google = GoogleServices::maybe_new(&config, &vault)?;
 
         if let Err(err) = telemetry.record(
@@ -162,6 +169,8 @@ impl AppState {
         };
         let active_project_id = Arc::new(Mutex::new(initial_project_id));
         let places = PlaceNormalizer::new(Arc::clone(&db), &config);
+        places.set_rate_limit(settings.places_rate_limit_qps);
+        let settings = Arc::new(Mutex::new(settings));
 
         Ok(Self {
             handle,
@@ -170,6 +179,8 @@ impl AppState {
             db_path: path,
             vault,
             config,
+            settings,
+            settings_path,
             telemetry,
             db_bootstrap_recovered: recovered,
             db_key_lifecycle: key_lifecycle,
@@ -188,7 +199,12 @@ impl AppState {
             self.config.public_profile(),
             self.db_bootstrap_recovered,
             self.db_key_lifecycle.as_str().to_string(),
+            self.runtime_settings(),
         ))
+    }
+
+    fn runtime_settings(&self) -> RuntimeSettings {
+        self.settings.lock().runtime_profile()
     }
 
     pub fn map_style_descriptor(&self) -> MapStyleDescriptor {
@@ -257,10 +273,7 @@ impl AppState {
         self.google()?.start_device_flow().await
     }
 
-    pub fn comparison_snapshot(
-        &self,
-        project_id: Option<i64>,
-    ) -> AppResult<ComparisonSnapshot> {
+    pub fn comparison_snapshot(&self, project_id: Option<i64>) -> AppResult<ComparisonSnapshot> {
         let resolved = self.resolve_project_id(project_id)?;
         let conn = self.db.lock();
         comparison::compute_snapshot(&conn, resolved)
@@ -545,6 +558,27 @@ impl AppState {
             Ok(*self.active_project_id.lock())
         }
     }
+
+    pub fn update_runtime_settings(
+        &self,
+        payload: UpdateRuntimeSettingsPayload,
+    ) -> AppResult<RuntimeSettings> {
+        let sanitized = payload.sanitized();
+        {
+            let mut settings = self.settings.lock();
+            let previous_enabled = settings.telemetry_enabled;
+            let previous_qps = settings.places_rate_limit_qps;
+            settings.apply_patch(&sanitized);
+            settings.persist(&self.settings_path)?;
+            if settings.telemetry_enabled != previous_enabled {
+                self.telemetry.set_enabled(settings.telemetry_enabled);
+            }
+            if settings.places_rate_limit_qps != previous_qps {
+                self.places.set_rate_limit(settings.places_rate_limit_qps);
+            }
+        }
+        Ok(self.runtime_settings())
+    }
 }
 
 fn export_csv(path: &Path, rows: &[&PlaceComparisonRow]) -> AppResult<()> {
@@ -612,7 +646,9 @@ impl ExportFormat {
         match value.to_ascii_lowercase().as_str() {
             "csv" => Ok(Self::Csv),
             "json" => Ok(Self::Json),
-            other => Err(AppError::Config(format!("unsupported export format: {other}"))),
+            other => Err(AppError::Config(format!(
+                "unsupported export format: {other}"
+            ))),
         }
     }
 
@@ -666,7 +702,8 @@ pub fn run() {
             commands::create_comparison_project,
             commands::set_active_comparison_project,
             commands::map_style_descriptor,
-            commands::export_comparison_segment
+            commands::export_comparison_segment,
+            commands::update_runtime_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

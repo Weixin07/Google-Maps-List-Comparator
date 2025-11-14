@@ -22,6 +22,13 @@ Hardening pass for the Sprint 0 platform baseline: a Tauri + React desktop harne
 - **Manual refresh**: the new `refresh_place_details` Tauri command reuses the same queue logic and surfaces in the UI as a "Refresh details" action. Telemetry now includes per-import stats for total rows, cache hits, Places calls, and pending lookups so rate limiters/regressions are easy to spot.
 - **Comparison engine**: a `compare_lists` command computes overlap, A-only, and B-only sets directly from the normalized DB state, including pending counts derived from `raw_items`. React renders the snapshot with live counts and the top normalized places for each partition so QA can see deterministic results immediately after an import.
 
+## Sprint 4 Highlights
+
+- **Settings control plane**: the settings panel now surfaces SQLCipher lifecycle data, telemetry buffer paths, and drive config health while exposing a runtime telemetry toggle and Places API rate-limit slider wired to the Rust normalizer.
+- **Telemetry uplink**: the TypeScript telemetry adapter hashes `place_id` values with a per-install salt, falls back to the Tauri queue when offline, and can stream buffered batches to any PostHog-compatible endpoint.
+- **Packaging polish**: the NSIS template now ships the real product name/icons, embeds the WebView2 bootstrapper, and the README documents the unsigned installer expectations plus how secrets flow into `pnpm tauri build`.
+- **CI/CD release hooks**: GitHub Actions lint/type/test, build the Windows installer, upload it as an artifact, and attach it to a draft GitHub Release whenever a `v*` tag lands on `main`.
+
 ## Development Workflow
 
 Run these from the repository root:
@@ -56,6 +63,13 @@ Run these from the repository root:
 - The UI "Runtime status" section shows the encrypted DB path, telemetry buffer path, queue depth, bootstrap recovery status, and redacted key lifecycle so QA can quickly confirm health.
 - Telemetry events (`vault_audit`, `app_start`, signin/drive/import, and per-row `raw_row_hashed`) drain to `telemetry-buffer.jsonl` and rotate to timestamped archives when full. JSONL makes it easy to `rg` or `jq` through the backlog while offline.
 - A front-end telemetry adapter (see `src/telemetry/adapter.ts`) funnels UI events through a Tauri command that reuses the Rust buffer. Events are automatically throttled and flushed so future instrumentation can stay in TypeScript.
+
+## Installer Packaging
+
+- `src-tauri/tauri.conf.json` now carries the real product name, NSIS metadata, installer icon, and WebView2 bootstrapper so the Windows installer feels intentional.
+- Builds are unsigned on purpose; expect SmartScreen prompts until you provide `TAURI_PRIVATE_KEY`/`TAURI_KEY_PASSWORD` via the environment or CI secrets for code signing.
+- Supply secrets (e.g. `GOOGLE_PLACES_API_KEY`, `MAPTILER_API_KEY`, `TELEMETRY_ENDPOINT`) via environment variables before running `pnpm tauri build`. The GitHub Actions workflow passes through repository secrets automatically.
+- Pushing a release tag (`v*`) triggers a draft GitHub Release with the NSIS artifact attached so QA can download the installer straight from Actions output.
 
 ## Continuous Integration & Smoke Tests
 

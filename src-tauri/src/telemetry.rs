@@ -78,9 +78,11 @@ impl TelemetryClient {
         &self.buffer_path
     }
 
-    #[allow(dead_code)]
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.queue.lock().clear();
+        }
     }
 
     fn persist_locked(&self, queue: &mut Vec<TelemetryEvent>) -> AppResult<()> {

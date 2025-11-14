@@ -148,8 +148,14 @@ async fn device_flow_and_import_roundtrip() {
             |row| row.get(0),
         )
         .expect("project id");
-    let summary = persist_rows(&mut connection, project_id, ListSlot::A, "drive-file", &rows)
-        .expect("persist rows");
+    let summary = persist_rows(
+        &mut connection,
+        project_id,
+        ListSlot::A,
+        "drive-file",
+        &rows,
+    )
+    .expect("persist rows");
     assert_eq!(summary.row_count, 1);
 
     let telemetry = TelemetryClient::new(dir.path(), &config).expect("telemetry");
