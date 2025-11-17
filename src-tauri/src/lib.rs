@@ -288,9 +288,9 @@ impl AppState {
         payload: Value,
         flush: bool,
     ) -> AppResult<()> {
-        self.telemetry.record(name, payload)?;
+        self.telemetry.record_lossy(name, payload);
         if flush {
-            self.telemetry.flush()?;
+            self.telemetry.flush_lossy();
         }
         Ok(())
     }

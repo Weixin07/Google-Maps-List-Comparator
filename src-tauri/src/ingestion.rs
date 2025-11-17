@@ -164,13 +164,13 @@ pub fn enqueue_place_hashes(
     rows: &[NormalizedRow],
 ) -> AppResult<()> {
     for row in rows {
-        telemetry.record(
+        telemetry.record_lossy(
             "raw_row_hashed",
             serde_json::json!({
                 "slot": slot.as_tag(),
                 "place_hash": row.place_hash(),
             }),
-        )?;
+        );
     }
     Ok(())
 }
