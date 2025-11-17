@@ -7,14 +7,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
+use tracing::warn;
 
 #[cfg(test)]
 use std::io;
 
 use crate::config::AppConfig;
-#[cfg(test)]
-use crate::errors::AppError;
-use crate::errors::AppResult;
+use crate::errors::{AppError, AppResult};
 
 #[derive(Clone)]
 pub struct TelemetryClient {
@@ -65,9 +64,21 @@ impl TelemetryClient {
         Ok(())
     }
 
+    pub fn record_lossy(&self, name: impl Into<String>, payload: serde_json::Value) {
+        if let Err(err) = self.record(name, payload) {
+            self.log_buffer_error("record", &err);
+        }
+    }
+
     pub fn flush(&self) -> AppResult<()> {
         let mut queue = self.queue.lock();
         self.persist_locked(&mut queue)
+    }
+
+    pub fn flush_lossy(&self) {
+        if let Err(err) = self.flush() {
+            self.log_buffer_error("flush", &err);
+        }
     }
 
     pub fn queue_depth(&self) -> usize {
@@ -214,6 +225,16 @@ impl TelemetryClient {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "telemetry-buffer".into())
+    }
+
+    fn log_buffer_error(&self, stage: &str, err: &AppError) {
+        warn!(
+            target: "telemetry_buffer",
+            stage,
+            path = %self.buffer_path.display(),
+            error = %err,
+            "telemetry buffering failed; queue retained in memory"
+        );
     }
 }
 
@@ -400,6 +421,25 @@ mod tests {
         let result = client.record("rotate", json!({}));
         assert!(result.is_err());
         assert_eq!(client.queue_depth(), 1);
+    }
+
+    #[test]
+    fn flushes_after_transient_disk_error() {
+        let dir = tempdir().unwrap();
+        let mut config = test_config();
+        config.telemetry_batch_size = 1;
+        let mut client = TelemetryClient::new(dir.path(), &config).unwrap();
+        let hooks = client.enable_test_hooks();
+        hooks.fail_next_disk_full();
+
+        let result = client.record("retry_later", json!({}));
+        assert!(result.is_err());
+        assert_eq!(client.queue_depth(), 1);
+
+        client.flush().unwrap();
+        assert_eq!(client.queue_depth(), 0);
+        let buffer = std::fs::read_to_string(client.buffer_path()).unwrap();
+        assert!(buffer.contains("retry_later"));
     }
 
     fn test_config() -> AppConfig {

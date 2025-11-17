@@ -67,7 +67,7 @@ pub fn bootstrap<P: AsRef<Path>>(
                 recovered: true,
             })
         }
-        Err(err) => Err(err),
+        Err(err) => Err(enrich_bootstrap_error(err, &db_path)),
     }
 }
 
@@ -286,6 +286,14 @@ fn assert_encrypted(db_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+fn enrich_bootstrap_error(err: AppError, db_path: &Path) -> AppError {
+    AppError::Config(format!(
+        "failed to open encrypted database at {}: {err}. Remove the existing data file and keychain entry '{}' to force a clean bootstrap",
+        db_path.display(),
+        DB_KEY_ALIAS
+    ))
+}
+
 fn should_attempt_recovery(err: &SqliteError, db_path: &Path) -> bool {
     if !db_path.exists() {
         return false;
@@ -455,5 +463,43 @@ mod tests {
         let recovered = bootstrap(dir.path(), "rotate.db", &vault).unwrap();
         assert!(recovered.recovered);
         assert_eq!(recovered.key_lifecycle, SecretLifecycle::Rotated);
+    }
+
+    #[test]
+    fn configures_wal_and_foreign_keys_pragmas() {
+        let dir = tempdir().unwrap();
+        let vault = SecretVault::in_memory();
+        let bootstrap = bootstrap(dir.path(), "wal.db", &vault).unwrap();
+        let conn = bootstrap.context.connection;
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn applies_cipher_pragmas_before_migrations() {
+        let dir = tempdir().unwrap();
+        let vault = SecretVault::in_memory();
+        let bootstrap = bootstrap(dir.path(), "cipher-pragmas.db", &vault).unwrap();
+        let conn = bootstrap.context.connection;
+
+        let kdf_iter: String = conn
+            .pragma_query_value(None, "cipher_default_kdf_iter", |row| row.get(0))
+            .unwrap();
+        let kdf_iter: i64 = kdf_iter.parse().unwrap_or(-1);
+        assert_eq!(kdf_iter, 64000);
+
+        let page_size: String = conn
+            .pragma_query_value(None, "cipher_default_page_size", |row| row.get(0))
+            .unwrap();
+        let page_size: i64 = page_size.parse().unwrap_or(-1);
+        assert_eq!(page_size, 4096);
     }
 }

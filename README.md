@@ -57,6 +57,7 @@ Run these from the repository root:
 - `.env.development` is checked in with safe placeholder values so the desktop shell boots with telemetry enabled and stub API keys. Copy it to `.env.local` for custom tweaks.
 - `.env` files are **only** loaded in debug/dev builds. Production binaries rely on real environment variables or the OS keychain. If you need `.env` during automated testing, opt-in via `ALLOW_DOTENV=1`.
 - Database keys live under the OS keychain service `GoogleMapsListComparator` and are never written to disk. Deleting/corrupting the entry automatically forces a secure rebootstrap on next launch.
+- Keychain prerequisites: keep your login keyring/keychain unlocked (or a reasonable Secret Service running on Linux) so the SQLCipher key can be created and read. Errors surface in `foundation_health` with the recovered flag and lifecycle string.
 - Telemetry buffer defaults can be tuned with:
   - `TELEMETRY_BUFFER_MAX_BYTES` (default `5 * 1024 * 1024`)
   - `TELEMETRY_BUFFER_MAX_FILES` (default `5`, includes the live file)
