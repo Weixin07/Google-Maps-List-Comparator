@@ -6,6 +6,7 @@ export type PublicAppConfig = {
   telemetry_buffer_max_bytes: number;
   telemetry_buffer_max_files: number;
   places_rate_limit_qps: number;
+  normalization_cache_ttl_hours: number;
   database_file_name: string;
   has_google_places_key: boolean;
   has_maptiler_key: boolean;

@@ -897,7 +897,10 @@ impl AppState {
                 "checksum": download.checksum_md5,
                 "normalized_rows": normalization.resolved,
                 "cache_hits": normalization.cache_hits,
+                "cache_misses": normalization.cache_misses,
+                "stale_cache": normalization.stale_cache,
                 "places_calls": normalization.places_calls,
+                "places_counters": normalization.places_counters,
                 "pending": normalization.unresolved,
             }),
         ) {

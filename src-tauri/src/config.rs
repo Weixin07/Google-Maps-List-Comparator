@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub telemetry_buffer_max_bytes: u64,
     pub telemetry_buffer_max_files: usize,
     pub places_rate_limit_qps: u32,
+    pub normalization_cache_ttl_hours: u64,
     pub database_file_name: String,
     pub google_places_api_key: Option<SecretString>,
     pub maptiler_key: Option<SecretString>,
@@ -44,6 +45,7 @@ pub struct PublicAppConfig {
     pub telemetry_buffer_max_bytes: u64,
     pub telemetry_buffer_max_files: usize,
     pub places_rate_limit_qps: u32,
+    pub normalization_cache_ttl_hours: u64,
     pub database_file_name: String,
     pub has_google_places_key: bool,
     pub has_maptiler_key: bool,
@@ -69,6 +71,7 @@ impl AppConfig {
             )
             .max(1),
             places_rate_limit_qps: parse_u32("PLACES_RATE_LIMIT_QPS", 3),
+            normalization_cache_ttl_hours: parse_u64("NORMALIZATION_CACHE_TTL_HOURS", 72),
             database_file_name: env::var("DATABASE_FILE_NAME")
                 .unwrap_or_else(|_| "maps-list-comparator.db".to_string()),
             google_places_api_key: env::var("GOOGLE_PLACES_API_KEY")
@@ -111,6 +114,7 @@ impl AppConfig {
             telemetry_buffer_max_bytes: self.telemetry_buffer_max_bytes,
             telemetry_buffer_max_files: self.telemetry_buffer_max_files,
             places_rate_limit_qps: self.places_rate_limit_qps,
+            normalization_cache_ttl_hours: self.normalization_cache_ttl_hours,
             database_file_name: self.database_file_name.clone(),
             has_google_places_key: self.google_places_api_key.is_some(),
             has_maptiler_key: self.maptiler_key.is_some(),

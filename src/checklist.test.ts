@@ -30,6 +30,7 @@ const baseHealth: FoundationHealth = {
     telemetry_buffer_max_bytes: 1000,
     telemetry_buffer_max_files: 2,
     places_rate_limit_qps: 3,
+    normalization_cache_ttl_hours: 72,
     database_file_name: "test.db",
     has_google_places_key: false,
     has_maptiler_key: false,

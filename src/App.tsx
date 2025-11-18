@@ -110,9 +110,19 @@ type NormalizationStats = {
   slot: ListSlot;
   total_rows: number;
   cache_hits: number;
+  cache_misses: number;
+  stale_cache: number;
   places_calls: number;
   resolved: number;
   unresolved: number;
+  places_counters: {
+    total_requests: number;
+    successes: number;
+    quota_errors: number;
+    invalid_key_errors: number;
+    network_errors: number;
+    other_errors: number;
+  };
 };
 
 const checklistTemplate: ChecklistItem[] = [

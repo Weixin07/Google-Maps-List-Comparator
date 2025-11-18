@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use parking_lot::Mutex;
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use reqwest::StatusCode;
 use rusqlite::{Connection, OptionalExtension};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -22,6 +23,14 @@ const GEO_EPSILON: f64 = 0.00001;
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 250;
 
+fn cache_ttl_from_hours(hours: u64) -> Option<Duration> {
+    if hours == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(hours.saturating_mul(3600)))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RawRow {
     source_hash: String,
@@ -33,9 +42,12 @@ pub struct NormalizationStats {
     pub slot: ListSlot,
     pub total_rows: usize,
     pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub stale_cache: usize,
     pub places_calls: usize,
     pub resolved: usize,
     pub unresolved: usize,
+    pub places_counters: PlacesCountersSnapshot,
 }
 
 impl NormalizationStats {
@@ -44,9 +56,12 @@ impl NormalizationStats {
             slot,
             total_rows: 0,
             cache_hits: 0,
+            cache_misses: 0,
+            stale_cache: 0,
             places_calls: 0,
             resolved: 0,
             unresolved: 0,
+            places_counters: PlacesCountersSnapshot::default(),
         }
     }
 
@@ -58,10 +73,21 @@ impl NormalizationStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct PlacesCountersSnapshot {
+    pub total_requests: u64,
+    pub successes: u64,
+    pub quota_errors: u64,
+    pub invalid_key_errors: u64,
+    pub network_errors: u64,
+    pub other_errors: u64,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizationResult {
     source: ResolutionSource,
     details: PlaceDetails,
+    cache_outcome: CacheOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +99,38 @@ pub struct NormalizationProgress {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlacesErrorKind {
+    Quota,
+    InvalidKey,
+    Network,
+    Other,
+}
+
+impl PlacesErrorKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            PlacesErrorKind::Quota => "quota",
+            PlacesErrorKind::InvalidKey => "invalid_key",
+            PlacesErrorKind::Network => "network",
+            PlacesErrorKind::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolutionSource {
     Provided,
     Cache,
     PlacesTable,
     Api,
+}
+
+#[derive(Debug, Clone)]
+enum CacheOutcome {
+    Fresh(String),
+    Stale(String),
+    Miss,
+    Skipped,
 }
 
 #[derive(Debug, Clone)]
@@ -100,11 +153,60 @@ impl PlaceDetails {
     }
 }
 
+#[derive(Default)]
+struct PlacesClientCounters {
+    total_requests: AtomicU64,
+    successes: AtomicU64,
+    quota_errors: AtomicU64,
+    invalid_key_errors: AtomicU64,
+    network_errors: AtomicU64,
+    other_errors: AtomicU64,
+}
+
+impl PlacesClientCounters {
+    fn record_attempt(&self) {
+        self.total_requests.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_error(&self, kind: PlacesErrorKind) {
+        match kind {
+            PlacesErrorKind::Quota => {
+                self.quota_errors.fetch_add(1, Ordering::SeqCst);
+            }
+            PlacesErrorKind::InvalidKey => {
+                self.invalid_key_errors.fetch_add(1, Ordering::SeqCst);
+            }
+            PlacesErrorKind::Network => {
+                self.network_errors.fetch_add(1, Ordering::SeqCst);
+            }
+            PlacesErrorKind::Other => {
+                self.other_errors.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PlacesCountersSnapshot {
+        PlacesCountersSnapshot {
+            total_requests: self.total_requests.load(Ordering::SeqCst),
+            successes: self.successes.load(Ordering::SeqCst),
+            quota_errors: self.quota_errors.load(Ordering::SeqCst),
+            invalid_key_errors: self.invalid_key_errors.load(Ordering::SeqCst),
+            network_errors: self.network_errors.load(Ordering::SeqCst),
+            other_errors: self.other_errors.load(Ordering::SeqCst),
+        }
+    }
+}
+
 pub struct PlaceNormalizer {
     db: Arc<Mutex<Connection>>,
     lookup: PlacesService,
     rate_limiter: RateLimiter,
     jitter_rng: Arc<Mutex<StdRng>>,
+    cache_ttl: Option<Duration>,
     guard: Arc<AsyncMutex<()>>,
 }
 
@@ -112,11 +214,13 @@ impl PlaceNormalizer {
     pub fn new(db: Arc<Mutex<Connection>>, config: &AppConfig) -> Self {
         let lookup = PlacesService::new(config);
         let rate_limiter = RateLimiter::new(config.places_rate_limit_qps.max(1));
+        let cache_ttl = cache_ttl_from_hours(config.normalization_cache_ttl_hours);
         Self {
             db,
             lookup,
             rate_limiter,
             jitter_rng: Arc::new(Mutex::new(StdRng::from_entropy())),
+            cache_ttl,
             guard: Arc::new(AsyncMutex::new(())),
         }
     }
@@ -127,12 +231,14 @@ impl PlaceNormalizer {
         lookup: PlacesService,
         qps: u32,
         rng: StdRng,
+        cache_ttl: Duration,
     ) -> Self {
         Self {
             db,
             lookup,
             rate_limiter: RateLimiter::new(qps.max(1)),
             jitter_rng: Arc::new(Mutex::new(rng)),
+            cache_ttl: Some(cache_ttl),
             guard: Arc::new(AsyncMutex::new(())),
         }
     }
@@ -154,11 +260,15 @@ impl PlaceNormalizer {
     ) -> AppResult<NormalizationStats> {
         let _lock = self.guard.lock().await;
         let Some((list_id, rows)) = self.load_rows(project_id, slot)? else {
-            return Ok(NormalizationStats::empty(slot));
+            let mut empty = NormalizationStats::empty(slot);
+            empty.places_counters = self.lookup.counters_snapshot();
+            return Ok(empty);
         };
 
         if rows.is_empty() {
-            return Ok(NormalizationStats::empty(slot));
+            let mut empty = NormalizationStats::empty(slot);
+            empty.places_counters = self.lookup.counters_snapshot();
+            return Ok(empty);
         }
 
         self.clear_assignments(list_id)?;
@@ -174,11 +284,18 @@ impl PlaceNormalizer {
             }
             match self.normalize_row(&entry).await {
                 Ok(Some(result)) => {
-                    if matches!(
-                        result.source,
-                        ResolutionSource::Cache | ResolutionSource::PlacesTable
-                    ) {
-                        stats.cache_hits += 1;
+                    match result.cache_outcome {
+                        CacheOutcome::Fresh(_) => {
+                            stats.cache_hits += 1;
+                        }
+                        CacheOutcome::Stale(_) => {
+                            stats.cache_misses += 1;
+                            stats.stale_cache += 1;
+                        }
+                        CacheOutcome::Miss => {
+                            stats.cache_misses += 1;
+                        }
+                        CacheOutcome::Skipped => {}
                     }
                     if matches!(result.source, ResolutionSource::Api) {
                         stats.places_calls += 1;
@@ -210,6 +327,7 @@ impl PlaceNormalizer {
                 stats.unresolved += total_rows - processed;
             }
         }
+        stats.places_counters = self.lookup.counters_snapshot();
 
         Ok(stats)
     }
@@ -295,24 +413,33 @@ impl PlaceNormalizer {
             return Ok(Some(NormalizationResult {
                 source: ResolutionSource::Provided,
                 details,
+                cache_outcome: CacheOutcome::Skipped,
             }));
         }
 
-        if let Some(place_id) = self.lookup_cache(&entry.source_hash)? {
+        let cache_outcome = self.lookup_cache(&entry.source_hash)?;
+        let cache_marker = cache_outcome.clone();
+        if let CacheOutcome::Fresh(place_id) = cache_outcome {
             let details = self
                 .load_place_by_id(&place_id)?
                 .unwrap_or_else(|| details_from_row(&entry.row, place_id.clone()));
             return Ok(Some(NormalizationResult {
                 source: ResolutionSource::Cache,
                 details,
+                cache_outcome: CacheOutcome::Fresh(place_id),
             }));
         }
 
-        if let Some(details) = self.lookup_coordinates(&entry.row)? {
-            return Ok(Some(NormalizationResult {
-                source: ResolutionSource::PlacesTable,
-                details,
-            }));
+        let allow_coordinate_cache = !matches!(cache_marker, CacheOutcome::Stale(_));
+        if allow_coordinate_cache {
+            if let Some(details) = self.lookup_coordinates(&entry.row)? {
+                let place_id = details.place_id.clone();
+                return Ok(Some(NormalizationResult {
+                    source: ResolutionSource::PlacesTable,
+                    details,
+                    cache_outcome: CacheOutcome::Fresh(place_id),
+                }));
+            }
         }
 
         let details = self.lookup_with_retry(&entry.row).await?;
@@ -320,18 +447,42 @@ impl PlaceNormalizer {
         Ok(Some(NormalizationResult {
             source: ResolutionSource::Api,
             details: finalized,
+            cache_outcome: match cache_marker {
+                CacheOutcome::Stale(value) => CacheOutcome::Stale(value),
+                _ => CacheOutcome::Miss,
+            },
         }))
     }
 
-    fn lookup_cache(&self, source_hash: &str) -> AppResult<Option<String>> {
+    fn lookup_cache(&self, source_hash: &str) -> AppResult<CacheOutcome> {
         let conn = self.db.lock();
-        conn.query_row(
-            "SELECT place_id FROM normalization_cache WHERE source_row_hash = ?1",
-            [source_hash],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(AppError::from)
+        let record: Option<(String, String)> = conn
+            .query_row(
+                "SELECT place_id, created_at FROM normalization_cache WHERE source_row_hash = ?1",
+                [source_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((place_id, created_at)) = record else {
+            return Ok(CacheOutcome::Miss);
+        };
+
+        if let Some(ttl) = self.cache_ttl {
+            let ttl_secs = ttl.as_secs() as f64;
+            let age_secs: f64 = conn
+                .query_row(
+                    "SELECT (julianday('now') - julianday(?1)) * 86400.0",
+                    [created_at],
+                    |row| row.get(0),
+                )
+                .unwrap_or(ttl_secs + 1.0);
+            if age_secs > ttl_secs {
+                return Ok(CacheOutcome::Stale(place_id));
+            }
+        }
+
+        Ok(CacheOutcome::Fresh(place_id))
     }
 
     fn lookup_coordinates(&self, row: &NormalizedRow) -> AppResult<Option<PlaceDetails>> {
@@ -369,10 +520,17 @@ impl PlaceNormalizer {
             match self.lookup.lookup_place(row).await {
                 Ok(details) => return Ok(details),
                 Err(err) if attempt < MAX_ATTEMPTS => {
+                    let kind = classify_places_error(&err);
+                    if matches!(kind, PlacesErrorKind::InvalidKey) {
+                        return Err(err);
+                    }
                     let delay = self.backoff_delay(attempt);
                     warn!(
                         ?err,
-                        attempt, "places lookup failed; retrying after {:?}", delay
+                        attempt,
+                        category = kind.as_str(),
+                        "places lookup failed; retrying after {:?}",
+                        delay
                     );
                     sleep(delay).await;
                 }
@@ -501,31 +659,42 @@ fn parse_place_details(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlaceDetails
 #[derive(Clone)]
 pub struct PlacesService {
     inner: Arc<dyn PlaceLookup>,
+    counters: Arc<PlacesClientCounters>,
 }
 
 impl PlacesService {
     pub fn new(config: &AppConfig) -> Self {
+        let counters = Arc::new(PlacesClientCounters::default());
         if let Some(key) = config.google_places_api_key.clone() {
-            let http = HttpPlacesClient::new(key);
+            let http = HttpPlacesClient::new(key, Arc::clone(&counters));
             let synthetic = SyntheticPlacesClient::default();
             let client = HybridPlacesClient::new(http, synthetic);
             Self {
                 inner: Arc::new(client),
+                counters,
             }
         } else {
             Self {
                 inner: Arc::new(SyntheticPlacesClient::default()),
+                counters,
             }
         }
     }
 
     #[cfg(test)]
     pub fn from_lookup(lookup: Arc<dyn PlaceLookup>) -> Self {
-        Self { inner: lookup }
+        Self {
+            inner: lookup,
+            counters: Arc::new(PlacesClientCounters::default()),
+        }
     }
 
     pub async fn lookup_place(&self, row: &NormalizedRow) -> AppResult<PlaceDetails> {
         self.inner.lookup_place(row).await
+    }
+
+    pub fn counters_snapshot(&self) -> PlacesCountersSnapshot {
+        self.counters.snapshot()
     }
 }
 
@@ -581,6 +750,31 @@ impl RateLimiter {
     }
 }
 
+fn classify_places_error(err: &AppError) -> PlacesErrorKind {
+    match err {
+        AppError::Http(http_err) => {
+            if http_err.is_timeout() || http_err.is_connect() {
+                return PlacesErrorKind::Network;
+            }
+            if let Some(status) = http_err.status() {
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    || status == StatusCode::SERVICE_UNAVAILABLE
+                {
+                    return PlacesErrorKind::Quota;
+                }
+                if status == StatusCode::UNAUTHORIZED
+                    || status == StatusCode::FORBIDDEN
+                    || status == StatusCode::PAYMENT_REQUIRED
+                {
+                    return PlacesErrorKind::InvalidKey;
+                }
+            }
+            PlacesErrorKind::Other
+        }
+        _ => PlacesErrorKind::Other,
+    }
+}
+
 struct HybridPlacesClient {
     primary: HttpPlacesClient,
     fallback: SyntheticPlacesClient,
@@ -611,15 +805,27 @@ impl PlaceLookup for HybridPlacesClient {
 struct HttpPlacesClient {
     http: reqwest::Client,
     api_key: SecretString,
+    counters: Arc<PlacesClientCounters>,
 }
 
 impl HttpPlacesClient {
-    fn new(api_key: SecretString) -> Self {
+    fn new(api_key: SecretString, counters: Arc<PlacesClientCounters>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("places http client");
-        Self { http, api_key }
+        Self {
+            http,
+            api_key,
+            counters,
+        }
+    }
+
+    fn record_http_error(&self, err: reqwest::Error) -> AppError {
+        let app_err: AppError = err.into();
+        let kind = classify_places_error(&app_err);
+        self.counters.record_error(kind);
+        app_err
     }
 }
 
@@ -697,6 +903,7 @@ impl PlaceLookup for HttpPlacesClient {
             },
         };
 
+        self.counters.record_attempt();
         let response = self
             .http
             .post("https://places.googleapis.com/v1/places:searchText")
@@ -707,10 +914,16 @@ impl PlaceLookup for HttpPlacesClient {
             )
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|err| self.record_http_error(err))?
+            .error_for_status()
+            .map_err(|err| self.record_http_error(err))?;
 
-        let parsed: Response = response.json().await?;
+        let parsed: Response = response.json().await.map_err(|err| {
+            self.counters.record_error(PlacesErrorKind::Other);
+            AppError::from(err)
+        })?;
+        self.counters.record_success();
         let place = parsed
             .places
             .and_then(|mut list| list.pop())
@@ -868,6 +1081,7 @@ mod tests {
             lookup,
             3,
             rand::rngs::StdRng::seed_from_u64(1),
+            Duration::from_secs(3600),
         );
 
         let stats = normalizer
@@ -875,8 +1089,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_misses, 0);
+        assert_eq!(stats.stale_cache, 0);
         assert_eq!(stats.places_calls, 0);
         assert_eq!(stats.resolved, 1);
+        assert_eq!(stats.places_counters.total_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_cache_entries_trigger_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = SecretVault::in_memory();
+        let bootstrap = bootstrap(dir.path(), "stale_cache.db", &vault).unwrap();
+        let db = Arc::new(Mutex::new(bootstrap.context.connection));
+
+        let project_id: i64 = {
+            let conn = db.lock();
+            let project_id = conn
+                .query_row(
+                    "SELECT id FROM comparison_projects WHERE is_active = 1 LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO lists (project_id, slot, name, source) VALUES (?1, 'A', 'List A', 'test')",
+                [project_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO raw_items (list_id, source_row_hash, raw_json) VALUES (1, 'hash', ?1)",
+                [serde_json::to_string(&NormalizedRow {
+                    title: "Stale".into(),
+                    description: None,
+                    longitude: 1.0,
+                    latitude: 2.0,
+                    altitude: None,
+                    place_id: None,
+                    raw_coordinates: "1,2,0".into(),
+                    layer_path: None,
+                })
+                .unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO normalization_cache (source_row_hash, place_id, created_at) VALUES ('hash', 'stale_place', DATETIME('now', '-2 hours'))",
+                [],
+            )
+            .unwrap();
+            project_id
+        };
+
+        let lookup =
+            PlacesService::from_lookup(Arc::new(TestPlacesClient::new(vec![Ok(PlaceDetails {
+                place_id: "fresh_place".into(),
+                name: "Refreshed".into(),
+                formatted_address: None,
+                lat: 2.0,
+                lng: 1.0,
+                types: Vec::new(),
+            })])));
+
+        let normalizer = PlaceNormalizer::with_lookup(
+            db.clone(),
+            lookup,
+            3,
+            rand::rngs::StdRng::seed_from_u64(5),
+            Duration::from_secs(3600),
+        );
+
+        let stats = normalizer
+            .normalize_slot(project_id, ListSlot::A, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.stale_cache, 1);
+        assert_eq!(stats.places_calls, 1);
+
+        let refreshed: String = {
+            let conn = db.lock();
+            conn.query_row(
+                "SELECT place_id FROM normalization_cache WHERE source_row_hash = 'hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(refreshed, "fresh_place");
+
+        let (checked_at, assignments): (String, i64) = {
+            let conn = db.lock();
+            let checked: String = conn
+                .query_row(
+                    "SELECT last_checked_at FROM places WHERE place_id = 'fresh_place'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let linked: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM list_places WHERE place_id = 'fresh_place'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (checked, linked)
+        };
+        assert!(!checked_at.is_empty());
+        assert_eq!(assignments, 1);
     }
 
     #[tokio::test]
@@ -935,6 +1256,7 @@ mod tests {
             lookup,
             3,
             rand::rngs::StdRng::seed_from_u64(2),
+            Duration::from_secs(3600),
         );
 
         let stats = normalizer
@@ -942,6 +1264,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 1);
         assert_eq!(stats.places_calls, 1);
         assert_eq!(stats.resolved, 1);
     }
