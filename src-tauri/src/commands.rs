@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::comparison::{ComparisonSegment, ComparisonSnapshot};
 use crate::config::PublicAppConfig;
-use crate::google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity};
+use crate::google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity, LoopbackFlowState};
 use crate::ingestion::{ImportSummary, ListSlot};
 use crate::places::NormalizationStats;
 use crate::projects::ComparisonProjectRecord;
@@ -87,6 +87,16 @@ pub async fn google_start_device_flow(
 }
 
 #[tauri::command]
+pub async fn google_start_loopback_flow(
+    state: tauri::State<'_, AppState>,
+) -> Result<LoopbackFlowState, String> {
+    state
+        .start_loopback_flow()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub async fn google_complete_sign_in(
     state: tauri::State<'_, AppState>,
     device_code: String,
@@ -96,6 +106,49 @@ pub async fn google_complete_sign_in(
         .complete_device_flow(device_code, interval_secs.unwrap_or(5))
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn google_complete_loopback_sign_in(
+    state: tauri::State<'_, AppState>,
+    timeout_secs: Option<u64>,
+) -> Result<GoogleIdentity, String> {
+    state
+        .complete_loopback_sign_in(timeout_secs)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn google_current_identity(
+    state: tauri::State<'_, AppState>,
+) -> Result<GoogleIdentity, String> {
+    state
+        .current_identity()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn google_keepalive(
+    state: tauri::State<'_, AppState>,
+) -> Result<GoogleIdentity, String> {
+    state
+        .keepalive_google()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn google_refresh_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(state.refresh_status_google())
+}
+
+#[tauri::command]
+pub async fn google_sign_out(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.sign_out_google().map_err(|err| err.to_string())
 }
 
 #[tauri::command]

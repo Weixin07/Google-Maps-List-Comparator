@@ -7,6 +7,7 @@ use tracing::debug;
 const DEFAULT_TELEMETRY_BUFFER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_TELEMETRY_BUFFER_MAX_FILES: usize = 5;
 const DEFAULT_DEVICE_CODE_ENDPOINT: &str = "https://oauth2.googleapis.com/device/code";
+const DEFAULT_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const DEFAULT_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const DEFAULT_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const DEFAULT_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
@@ -27,6 +28,7 @@ pub struct AppConfig {
     pub google_oauth_client_id: Option<String>,
     pub google_oauth_client_secret: Option<String>,
     pub google_device_code_endpoint: String,
+    pub google_auth_endpoint: String,
     pub google_token_endpoint: String,
     pub google_userinfo_endpoint: String,
     pub google_drive_api_base: String,
@@ -85,6 +87,8 @@ impl AppConfig {
                 .filter(|v| !v.trim().is_empty()),
             google_device_code_endpoint: env::var("GOOGLE_DEVICE_CODE_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_DEVICE_CODE_ENDPOINT.to_string()),
+            google_auth_endpoint: env::var("GOOGLE_AUTH_ENDPOINT")
+                .unwrap_or_else(|_| DEFAULT_AUTH_ENDPOINT.to_string()),
             google_token_endpoint: env::var("GOOGLE_TOKEN_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_TOKEN_ENDPOINT.to_string()),
             google_userinfo_endpoint: env::var("GOOGLE_USERINFO_ENDPOINT")

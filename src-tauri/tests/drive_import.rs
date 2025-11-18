@@ -108,7 +108,9 @@ async fn device_flow_and_import_roundtrip() {
 
     let vault = SecretVault::in_memory();
     let config = AppConfig::from_env();
-    let google = GoogleServices::maybe_new(&config, &vault)
+    let temp_dir = tempdir().unwrap();
+    let telemetry = TelemetryClient::new(temp_dir.path(), &config).unwrap();
+    let google = GoogleServices::maybe_new(&config, &vault, telemetry)
         .expect("service creation")
         .expect("oauth configured");
 

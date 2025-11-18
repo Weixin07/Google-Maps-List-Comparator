@@ -46,7 +46,9 @@ const VAULT_SERVICE_NAME: &str = "GoogleMapsListComparator";
 pub use commands::foundation_health;
 pub use config::AppConfig;
 pub use db::bootstrap;
-pub use google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity, GoogleServices};
+pub use google::{
+    DeviceFlowState, DriveFileMetadata, GoogleIdentity, GoogleServices, LoopbackFlowState,
+};
 pub use ingestion::{enqueue_place_hashes, parse_kml, persist_rows, ImportSummary, ListSlot};
 pub use secrets::SecretVault;
 pub use telemetry::TelemetryClient;
@@ -162,7 +164,7 @@ impl AppState {
         } = bootstrap(&data_dir, &config.database_file_name, &vault)?;
         let telemetry = TelemetryClient::new(&data_dir, &config)?;
         telemetry.set_enabled(settings.telemetry_enabled);
-        let google = GoogleServices::maybe_new(&config, &vault)?;
+        let google = GoogleServices::maybe_new(&config, &vault, telemetry.clone())?;
 
         if let Err(err) = telemetry.record(
             "vault_audit",
@@ -374,17 +376,49 @@ impl AppState {
             .complete_device_flow(&device_code, interval_secs)
             .await?;
 
-        if let Err(err) = self.telemetry.record(
-            "signin_success",
-            json!({
-                "email": identity.email,
-                "expires_at": identity.expires_at,
-            }),
-        ) {
-            warn!(?err, "failed to record signin_success telemetry");
-        }
+        self.record_signin_success(&identity);
 
         Ok(identity)
+    }
+
+    pub async fn start_loopback_flow(&self) -> AppResult<LoopbackFlowState> {
+        self.google()?.start_loopback_flow().await
+    }
+
+    pub async fn complete_loopback_sign_in(
+        &self,
+        timeout_secs: Option<u64>,
+    ) -> AppResult<GoogleIdentity> {
+        match self
+            .google()?
+            .complete_loopback_flow(timeout_secs)
+            .await
+        {
+            Ok(identity) => {
+                self.record_signin_success(&identity);
+                Ok(identity)
+            }
+            Err(err) => {
+                self.record_signin_error(&err.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn current_identity(&self) -> AppResult<GoogleIdentity> {
+        self.google()?.current_identity().await
+    }
+
+    pub fn sign_out_google(&self) -> AppResult<()> {
+        self.google()?.sign_out()
+    }
+
+    pub async fn keepalive_google(&self) -> AppResult<GoogleIdentity> {
+        self.google()?.keepalive().await
+    }
+
+    pub fn refresh_status_google(&self) -> Option<String> {
+        self.google().ok().and_then(|svc| svc.last_refresh_failure())
     }
 
     pub async fn list_drive_files(
@@ -456,6 +490,29 @@ impl AppState {
                 );
                 Err(err)
             }
+        }
+    }
+
+    fn record_signin_success(&self, identity: &GoogleIdentity) {
+        if let Err(err) = self.telemetry.record(
+            "signin_success",
+            json!({
+                "email": identity.email,
+                "expires_at": identity.expires_at,
+            }),
+        ) {
+            warn!(?err, "failed to record signin_success telemetry");
+        }
+    }
+
+    fn record_signin_error(&self, reason: &str) {
+        if let Err(err) = self.telemetry.record(
+            "signin_error",
+            json!({
+                "reason": sanitize_error_copy(reason),
+            }),
+        ) {
+            warn!(?err, "failed to record signin_error telemetry");
         }
     }
 
@@ -958,6 +1015,12 @@ pub fn run() {
             commands::record_telemetry_event,
             commands::google_start_device_flow,
             commands::google_complete_sign_in,
+            commands::google_start_loopback_flow,
+            commands::google_complete_loopback_sign_in,
+            commands::google_current_identity,
+            commands::google_keepalive,
+            commands::google_refresh_status,
+            commands::google_sign_out,
             commands::drive_list_kml_files,
             commands::drive_import_kml,
             commands::refresh_place_details,

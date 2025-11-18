@@ -22,12 +22,10 @@ import { telemetry } from "./telemetry";
 import type { ChecklistItem } from "./checklist";
 import { resolveChecklist } from "./checklist";
 
-type DeviceFlowState = {
-  device_code: string;
-  user_code: string;
-  verification_url: string;
+type LoopbackFlowState = {
+  authorization_url: string;
+  redirect_url: string;
   expires_at: string;
-  interval_secs: number;
 };
 
 type GoogleIdentity = {
@@ -254,11 +252,12 @@ function App() {
     null,
   );
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
-  const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null);
+  const [loopbackFlow, setLoopbackFlow] = useState<LoopbackFlowState | null>(null);
   const [identity, setIdentity] = useState<GoogleIdentity | null>(null);
   const [signInError, setSignInError] = useState<string | null>(null);
   const [isRequestingCode, setIsRequestingCode] = useState(false);
   const [isCompletingSignIn, setIsCompletingSignIn] = useState(false);
+  const [isRestoringIdentity, setIsRestoringIdentity] = useState(false);
   const [driveFiles, setDriveFiles] = useState<DriveFileMetadata[]>([]);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
@@ -441,6 +440,55 @@ function App() {
   useEffect(() => {
     void loadProjects();
   }, [loadProjects]);
+
+  const driveEnabled = foundationHealth?.config.drive_import_enabled ?? false;
+
+  const restoreIdentity = useCallback(async () => {
+    if (!driveEnabled) {
+      setIdentity(null);
+      return;
+    }
+    setIsRestoringIdentity(true);
+    try {
+      const profile = await invoke<GoogleIdentity>("google_current_identity");
+      setIdentity(profile);
+    } catch {
+      setIdentity(null);
+    } finally {
+      setIsRestoringIdentity(false);
+    }
+  }, [driveEnabled]);
+
+  useEffect(() => {
+    if (!driveEnabled) {
+      return;
+    }
+    void restoreIdentity();
+  }, [driveEnabled, restoreIdentity]);
+
+  useEffect(() => {
+    if (!driveEnabled || !identity) {
+      return;
+    }
+    const interval = window.setInterval(() => {
+      void invoke<GoogleIdentity>("google_keepalive")
+        .then((profile) => {
+          setIdentity(profile);
+        })
+        .catch(async (error) => {
+          const message = normalizeError(error);
+          const lastFailure = await invoke<string | null>("google_refresh_status").catch(
+            () => null,
+          );
+          setSignInError(lastFailure ?? message);
+          setIdentity(null);
+          telemetry.track("signin_error", { reason: lastFailure ?? message });
+        });
+    }, 4 * 60 * 1000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [driveEnabled, identity]);
 
   useEffect(() => {
     let mounted = true;
@@ -882,45 +930,59 @@ useEffect(() => {
     [foundationHealth, isDevMode],
   );
 
-  const driveEnabled = foundationHealth?.config.drive_import_enabled ?? false;
-
-  const requestDeviceFlow = useCallback(async () => {
+  const startLoopbackSignIn = useCallback(async () => {
     if (!driveEnabled) {
       setSignInError("Drive import is disabled in this build.");
       return;
     }
-    setIsRequestingCode(true);
-    setSignInError(null);
-    try {
-      const flow = await invoke<DeviceFlowState>("google_start_device_flow");
-      setDeviceFlow(flow);
-      await openUrl(flow.verification_url);
-    } catch (error) {
-      setSignInError(normalizeError(error));
-    } finally {
-      setIsRequestingCode(false);
-    }
-  }, [driveEnabled]);
-
-  const completeDeviceFlow = useCallback(async () => {
-    if (!deviceFlow) {
+    if (isCompletingSignIn || isRequestingCode) {
       return;
     }
+    setIsRequestingCode(true);
     setIsCompletingSignIn(true);
     setSignInError(null);
     try {
-      const result = await invoke<GoogleIdentity>("google_complete_sign_in", {
-        deviceCode: deviceFlow.device_code,
-        intervalSecs: deviceFlow.interval_secs,
+      const flow = await invoke<LoopbackFlowState>("google_start_loopback_flow");
+      setLoopbackFlow(flow);
+      await openUrl(flow.authorization_url);
+      const result = await invoke<GoogleIdentity>("google_complete_loopback_sign_in", {
+        timeoutSecs: 180,
       });
       setIdentity(result);
+      setLoopbackFlow(null);
       telemetry.track("signin_success", { expiresAt: result.expires_at });
+    } catch (error) {
+      const message = normalizeError(error);
+      setSignInError(message);
+      setLoopbackFlow(null);
+      setIdentity(null);
+      telemetry.track("signin_error", { reason: message });
+    } finally {
+      setIsRequestingCode(false);
+      setIsCompletingSignIn(false);
+    }
+  }, [driveEnabled, isCompletingSignIn, isRequestingCode]);
+
+  const handleSignOut = useCallback(async () => {
+    setSignInError(null);
+    setLoopbackFlow(null);
+    try {
+      await invoke("google_sign_out");
     } catch (error) {
       setSignInError(normalizeError(error));
     } finally {
+      setIdentity(null);
+      setDriveFiles([]);
+      setIsRequestingCode(false);
       setIsCompletingSignIn(false);
+      setPickerError(null);
+      setSelectedFiles({ A: null, B: null });
+      setImports({
+        A: createImportState(),
+        B: createImportState(),
+      });
     }
-  }, [deviceFlow]);
+  }, []);
 
   const loadDriveFiles = useCallback(async () => {
     if (!identity) {
@@ -1738,44 +1800,34 @@ useEffect(() => {
                 Drive OAuth credentials are missing. Define GOOGLE_OAUTH_CLIENT_ID / SECRET to enable this surface.
               </p>
             )}
-            {driveEnabled && !identity && (
+            {driveEnabled && signInError && <p className="error-text">{signInError}</p>}
+            {driveEnabled && !identity && !isRestoringIdentity && (
               <>
                 <p>
-                  Use the OAuth device flow to approve access from your default browser; no embedded client secrets required.
+                  Approve Drive access in your default browser; the desktop shell listens on a local
+                  loopback redirect to finish sign-in automatically.
                 </p>
                 <button
                   type="button"
                   className="primary-button"
-                  onClick={requestDeviceFlow}
-                  disabled={isRequestingCode}
+                  onClick={startLoopbackSignIn}
+                  disabled={isRequestingCode || isCompletingSignIn}
                 >
-                  {isRequestingCode ? "Requesting code…" : "Sign in with Google"}
+                  {isCompletingSignIn
+                    ? "Waiting for approval…"
+                    : isRequestingCode
+                      ? "Opening browser…"
+                      : "Sign in with Google"}
                 </button>
+                {loopbackFlow && (
+                  <p className="muted">
+                    Listening for redirect via <code>{loopbackFlow.redirect_url}</code>
+                  </p>
+                )}
               </>
             )}
-            {signInError && <p className="error-text">{signInError}</p>}
-            {deviceFlow && !identity && (
-              <div className="device-flow">
-                <p>
-                  Enter code <code>{deviceFlow.user_code}</code> at{" "}
-                  <button
-                    type="button"
-                    className="link-button"
-                    onClick={() => openUrl(deviceFlow.verification_url)}
-                  >
-                    google.com/device
-                  </button>{" "}
-                  to approve Drive scope.
-                </p>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={completeDeviceFlow}
-                  disabled={isCompletingSignIn}
-                >
-                  {isCompletingSignIn ? "Waiting for approval…" : "I approved the request"}
-                </button>
-              </div>
+            {isRestoringIdentity && !identity && (
+              <p className="muted">Restoring Google identity from the secure vault…</p>
             )}
             {identity && (
               <div className="identity-summary">
@@ -1791,14 +1843,27 @@ useEffect(() => {
                     day: "numeric",
                   })}
                 </p>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={loadDriveFiles}
-                  disabled={isLoadingFiles}
-                >
-                  {isLoadingFiles ? "Refreshing files…" : "Reload Drive files"}
-                </button>
+                <div className="identity-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={startLoopbackSignIn}
+                    disabled={isRequestingCode || isCompletingSignIn}
+                  >
+                    {isCompletingSignIn ? "Refreshing session…" : "Re-authenticate"}
+                  </button>
+                  <button type="button" className="secondary-button" onClick={handleSignOut}>
+                    Sign out
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={loadDriveFiles}
+                    disabled={isLoadingFiles}
+                  >
+                    {isLoadingFiles ? "Refreshing files…" : "Reload Drive files"}
+                  </button>
+                </div>
               </div>
             )}
           </article>
