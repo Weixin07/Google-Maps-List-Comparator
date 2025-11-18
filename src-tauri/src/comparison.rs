@@ -1,16 +1,36 @@
+use std::cmp;
+
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 use crate::errors::{AppError, AppResult};
 use crate::ingestion::ListSlot;
 
+const DEFAULT_PAGE_SIZE: usize = 200;
+const MAX_PAGE_SIZE: usize = 1000;
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ComparisonSnapshot {
     pub project: ComparisonProjectInfo,
     pub stats: ComparisonStats,
-    pub overlap: Vec<PlaceComparisonRow>,
-    pub only_a: Vec<PlaceComparisonRow>,
-    pub only_b: Vec<PlaceComparisonRow>,
+    pub lists: ComparisonLists,
+    pub overlap: ComparisonSegmentPage,
+    pub only_a: ComparisonSegmentPage,
+    pub only_b: ComparisonSegmentPage,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ComparisonSegmentPage {
+    pub rows: Vec<PlaceComparisonRow>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ComparisonLists {
+    pub list_a_id: Option<i64>,
+    pub list_b_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -67,6 +87,53 @@ impl ComparisonSegment {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ComparisonPagination {
+    pub page: usize,
+    pub page_size: usize,
+}
+
+impl ComparisonPagination {
+    pub fn new(page: Option<usize>, page_size: Option<usize>) -> Self {
+        let sanitized_page_size = page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let sanitized_page = page.unwrap_or(1).max(1);
+        Self {
+            page: sanitized_page,
+            page_size: sanitized_page_size,
+        }
+    }
+
+    pub fn with_total(self, total: usize) -> Self {
+        if total == 0 {
+            return Self {
+                page: 1,
+                page_size: self.page_size,
+            };
+        }
+        let pages = (total + self.page_size - 1) / self.page_size;
+        let capped_page = cmp::min(self.page, pages);
+        Self {
+            page: capped_page.max(1),
+            page_size: self.page_size,
+        }
+    }
+
+    fn offset(&self) -> i64 {
+        self.page.saturating_sub(1).saturating_mul(self.page_size) as i64
+    }
+}
+
+impl Default for ComparisonPagination {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PlaceEntry {
     place_id: String,
@@ -91,32 +158,51 @@ impl PlaceEntry {
     }
 }
 
-pub fn compute_snapshot(conn: &Connection, project_id: i64) -> AppResult<ComparisonSnapshot> {
+pub fn compute_snapshot(
+    conn: &Connection,
+    project_id: i64,
+    pagination: Option<ComparisonPagination>,
+) -> AppResult<ComparisonSnapshot> {
     let project = project_info(conn, project_id)?;
     let list_a = list_id(conn, project_id, ListSlot::A)?;
     let list_b = list_id(conn, project_id, ListSlot::B)?;
-
-    let overlap = load_overlap(conn, list_a, list_b)?;
-    let only_a = load_only(conn, list_a, list_b, ListSlot::A)?;
-    let only_b = load_only(conn, list_b, list_a, ListSlot::B)?;
-
     let stats = ComparisonStats {
         list_a_count: count_places(conn, list_a)?,
         list_b_count: count_places(conn, list_b)?,
-        overlap_count: overlap.len(),
-        only_a_count: only_a.len(),
-        only_b_count: only_b.len(),
+        overlap_count: count_segment(conn, project_id, ComparisonSegment::Overlap)?,
+        only_a_count: count_segment(conn, project_id, ComparisonSegment::OnlyA)?,
+        only_b_count: count_segment(conn, project_id, ComparisonSegment::OnlyB)?,
         pending_a: pending_count(conn, list_a)?,
         pending_b: pending_count(conn, list_b)?,
     };
 
+    let overlap_page = pagination.map(|p| p.with_total(stats.overlap_count));
+    let only_a_page = pagination.map(|p| p.with_total(stats.only_a_count));
+    let only_b_page = pagination.map(|p| p.with_total(stats.only_b_count));
+    let overlap = load_segment(conn, project_id, ComparisonSegment::Overlap, overlap_page)?;
+    let only_a = load_segment(conn, project_id, ComparisonSegment::OnlyA, only_a_page)?;
+    let only_b = load_segment(conn, project_id, ComparisonSegment::OnlyB, only_b_page)?;
+
     Ok(ComparisonSnapshot {
         project,
         stats,
+        lists: ComparisonLists {
+            list_a_id: list_a,
+            list_b_id: list_b,
+        },
         overlap,
         only_a,
         only_b,
     })
+}
+
+pub fn load_segment_page(
+    conn: &Connection,
+    project_id: i64,
+    segment: ComparisonSegment,
+    pagination: ComparisonPagination,
+) -> AppResult<ComparisonSegmentPage> {
+    load_segment(conn, project_id, segment, Some(pagination))
 }
 
 fn project_info(conn: &Connection, project_id: i64) -> AppResult<ComparisonProjectInfo> {
@@ -178,88 +264,87 @@ fn count_places(conn: &Connection, list_id: Option<i64>) -> AppResult<usize> {
     .map_err(AppError::from)
 }
 
-fn load_overlap(
+fn count_segment(
     conn: &Connection,
-    list_a: Option<i64>,
-    list_b: Option<i64>,
+    project_id: i64,
+    segment: ComparisonSegment,
+) -> AppResult<usize> {
+    let table = segment_table(segment);
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1");
+    conn.query_row(&sql, [project_id], |row| row.get::<_, i64>(0))
+        .map(|value| value as usize)
+        .map_err(AppError::from)
+}
+
+fn load_segment(
+    conn: &Connection,
+    project_id: i64,
+    segment: ComparisonSegment,
+    pagination: Option<ComparisonPagination>,
+) -> AppResult<ComparisonSegmentPage> {
+    let total = count_segment(conn, project_id, segment)?;
+    let lists = segment_lists(segment);
+    let effective_pagination = pagination.map(|p| p.with_total(total));
+    let table = segment_table(segment);
+    let base_sql = format!(
+        "SELECT place_id, name, formatted_address, lat, lng, types
+        FROM {table}
+        WHERE project_id = ?1
+        ORDER BY name COLLATE NOCASE"
+    );
+
+    let mapper = |row: &Row<'_>| parse_place_entry(row);
+    let rows = if let Some(paging) = effective_pagination {
+        let limited = format!("{base_sql} LIMIT ?2 OFFSET ?3");
+        let mut stmt = conn.prepare(&limited)?;
+        let iter = stmt.query_map(
+            (project_id, paging.page_size as i64, paging.offset()),
+            mapper,
+        )?;
+        parse_segment_rows(iter, lists)
+    } else {
+        let mut stmt = conn.prepare(&base_sql)?;
+        let iter = stmt.query_map([project_id], mapper)?;
+        parse_segment_rows(iter, lists)
+    }?;
+
+    let (page, page_size) = effective_pagination
+        .map(|p| (p.page, p.page_size))
+        .unwrap_or_else(|| (1, cmp::max(total, 1)));
+
+    Ok(ComparisonSegmentPage {
+        rows,
+        total,
+        page,
+        page_size,
+    })
+}
+
+fn parse_segment_rows(
+    rows: impl Iterator<Item = rusqlite::Result<PlaceEntry>>,
+    lists: Vec<ListSlot>,
 ) -> AppResult<Vec<PlaceComparisonRow>> {
-    match (list_a, list_b) {
-        (Some(a), Some(b)) => {
-            let mut stmt = conn.prepare(
-                "SELECT p.place_id, p.name, p.formatted_address, p.lat, p.lng, p.types
-                FROM list_places lp
-                JOIN places p ON p.place_id = lp.place_id
-                WHERE lp.list_id = ?1
-                AND EXISTS (
-                    SELECT 1 FROM list_places other
-                    WHERE other.list_id = ?2 AND other.place_id = lp.place_id
-                )
-                ORDER BY p.name COLLATE NOCASE",
-            )?;
-            let rows = stmt.query_map((a, b), |row| {
-                Ok(PlaceEntry {
-                    place_id: row.get(0)?,
-                    name: row.get(1)?,
-                    formatted_address: row.get(2)?,
-                    lat: row.get(3)?,
-                    lng: row.get(4)?,
-                    types: decode_types(row.get(5)?),
-                })
-            })?;
-            let mut results = Vec::new();
-            for entry in rows {
-                results.push(entry?.into_row(vec![ListSlot::A, ListSlot::B]));
-            }
-            Ok(results)
-        }
-        _ => Ok(Vec::new()),
+    let mut results = Vec::new();
+    for entry in rows {
+        results.push(entry?.into_row(lists.clone()));
+    }
+    Ok(results)
+}
+
+fn segment_table(segment: ComparisonSegment) -> &'static str {
+    match segment {
+        ComparisonSegment::Overlap => "comparison_overlap",
+        ComparisonSegment::OnlyA => "comparison_only_a",
+        ComparisonSegment::OnlyB => "comparison_only_b",
     }
 }
 
-fn load_only(
-    conn: &Connection,
-    primary: Option<i64>,
-    secondary: Option<i64>,
-    slot: ListSlot,
-) -> AppResult<Vec<PlaceComparisonRow>> {
-    let Some(primary_id) = primary else {
-        return Ok(Vec::new());
-    };
-    let (sql, params) = if let Some(secondary_id) = secondary {
-        (
-            "SELECT p.place_id, p.name, p.formatted_address, p.lat, p.lng, p.types
-            FROM list_places lp
-            JOIN places p ON p.place_id = lp.place_id
-            WHERE lp.list_id = ?1
-            AND NOT EXISTS (
-                SELECT 1 FROM list_places other
-                WHERE other.list_id = ?2 AND other.place_id = lp.place_id
-            )
-            ORDER BY p.name COLLATE NOCASE",
-            (primary_id, secondary_id),
-        )
-    } else {
-        (
-            "SELECT p.place_id, p.name, p.formatted_address, p.lat, p.lng, p.types
-            FROM list_places lp
-            JOIN places p ON p.place_id = lp.place_id
-            WHERE lp.list_id = ?1
-            ORDER BY p.name COLLATE NOCASE",
-            (primary_id, 0),
-        )
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let mapper = |row: &Row<'_>| parse_place_entry(row);
-    let rows = if secondary.is_some() {
-        stmt.query_map(params, mapper)?
-    } else {
-        stmt.query_map([primary_id], mapper)?
-    };
-    let mut results = Vec::new();
-    for entry in rows {
-        results.push(entry?.into_row(vec![slot]));
+fn segment_lists(segment: ComparisonSegment) -> Vec<ListSlot> {
+    match segment {
+        ComparisonSegment::Overlap => vec![ListSlot::A, ListSlot::B],
+        ComparisonSegment::OnlyA => vec![ListSlot::A],
+        ComparisonSegment::OnlyB => vec![ListSlot::B],
     }
-    Ok(results)
 }
 
 fn parse_place_entry(row: &Row<'_>) -> rusqlite::Result<PlaceEntry> {
@@ -276,9 +361,9 @@ fn parse_place_entry(row: &Row<'_>) -> rusqlite::Result<PlaceEntry> {
 impl ComparisonSnapshot {
     pub fn rows_for_segment(&self, segment: ComparisonSegment) -> &[PlaceComparisonRow] {
         match segment {
-            ComparisonSegment::Overlap => &self.overlap,
-            ComparisonSegment::OnlyA => &self.only_a,
-            ComparisonSegment::OnlyB => &self.only_b,
+            ComparisonSegment::Overlap => &self.overlap.rows,
+            ComparisonSegment::OnlyA => &self.only_a.rows,
+            ComparisonSegment::OnlyB => &self.only_b.rows,
         }
     }
 }
@@ -367,13 +452,13 @@ mod tests {
                 .unwrap();
         }
 
-        let snapshot = compute_snapshot(conn.as_ref(), project_id).unwrap();
+        let snapshot = compute_snapshot(conn.as_ref(), project_id, None).unwrap();
         assert_eq!(snapshot.project.id, project_id);
         assert_eq!(snapshot.stats.overlap_count, 1);
         assert_eq!(snapshot.stats.only_a_count, 1);
         assert_eq!(snapshot.stats.only_b_count, 1);
-        assert_eq!(snapshot.overlap[0].place_id, "place_2");
-        assert_eq!(snapshot.only_a[0].place_id, "place_1");
-        assert_eq!(snapshot.only_b[0].place_id, "place_3");
+        assert_eq!(snapshot.overlap.rows[0].place_id, "place_2");
+        assert_eq!(snapshot.only_a.rows[0].place_id, "place_1");
+        assert_eq!(snapshot.only_b.rows[0].place_id, "place_3");
     }
 }

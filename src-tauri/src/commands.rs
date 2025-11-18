@@ -2,7 +2,9 @@ use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::comparison::{ComparisonSegment, ComparisonSnapshot};
+use crate::comparison::{
+    ComparisonPagination, ComparisonSegment, ComparisonSegmentPage, ComparisonSnapshot,
+};
 use crate::config::PublicAppConfig;
 use crate::google::{DeviceFlowState, DriveFileMetadata, GoogleIdentity, LoopbackFlowState};
 use crate::ingestion::{ImportSummary, ListSlot};
@@ -227,9 +229,30 @@ pub async fn cancel_refresh_queue(state: tauri::State<'_, AppState>) -> Result<(
 pub async fn compare_lists(
     state: tauri::State<'_, AppState>,
     project_id: Option<i64>,
+    page: Option<usize>,
+    page_size: Option<usize>,
 ) -> Result<ComparisonSnapshot, String> {
     state
-        .comparison_snapshot(project_id)
+        .comparison_snapshot(project_id, Some(ComparisonPagination::new(page, page_size)))
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn comparison_segment_page(
+    state: tauri::State<'_, AppState>,
+    project_id: Option<i64>,
+    segment: String,
+    page: Option<usize>,
+    page_size: Option<usize>,
+) -> Result<ComparisonSegmentPage, String> {
+    let parsed_segment = ComparisonSegment::parse(&segment)
+        .ok_or_else(|| format!("unsupported comparison segment: {segment}"))?;
+    state
+        .comparison_segment_page(
+            project_id,
+            parsed_segment,
+            ComparisonPagination::new(page, page_size),
+        )
         .map_err(|err| err.to_string())
 }
 
@@ -250,6 +273,17 @@ pub async fn create_comparison_project(
 ) -> Result<ComparisonProjectRecord, String> {
     state
         .create_comparison_project(name, activate.unwrap_or(true))
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn rename_comparison_project(
+    state: tauri::State<'_, AppState>,
+    project_id: i64,
+    name: String,
+) -> Result<ComparisonProjectRecord, String> {
+    state
+        .rename_comparison_project(project_id, name)
         .map_err(|err| err.to_string())
 }
 

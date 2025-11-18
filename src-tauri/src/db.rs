@@ -233,6 +233,27 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
     ensure_column(connection, "lists", "drive_file_size INTEGER")?;
     ensure_column(connection, "lists", "drive_modified_time TEXT")?;
     ensure_column(connection, "lists", "drive_file_checksum TEXT")?;
+    ensure_column(connection, "comparison_projects", "last_compared_at TEXT")?;
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS comparison_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES comparison_projects(id) ON DELETE CASCADE,
+            list_a_id INTEGER REFERENCES lists(id),
+            list_b_id INTEGER REFERENCES lists(id),
+            list_a_count INTEGER NOT NULL DEFAULT 0,
+            list_b_count INTEGER NOT NULL DEFAULT 0,
+            overlap_count INTEGER NOT NULL DEFAULT 0,
+            only_a_count INTEGER NOT NULL DEFAULT 0,
+            only_b_count INTEGER NOT NULL DEFAULT 0,
+            pending_a INTEGER NOT NULL DEFAULT 0,
+            pending_b INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+            completed_at TEXT NOT NULL DEFAULT (DATETIME('now'))
+        );
+        "#,
+    )?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_places_lat_lng ON places(lat, lng)",
         [],
@@ -241,6 +262,61 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_lists_project_slot ON lists(project_id, slot)",
         [],
+    )?;
+    connection.execute_batch(
+        r#"
+        DROP VIEW IF EXISTS comparison_overlap;
+        DROP VIEW IF EXISTS comparison_only_a;
+        DROP VIEW IF EXISTS comparison_only_b;
+
+        CREATE VIEW comparison_overlap AS
+        SELECT
+            la.project_id AS project_id,
+            p.place_id AS place_id,
+            p.name AS name,
+            p.formatted_address AS formatted_address,
+            p.lat AS lat,
+            p.lng AS lng,
+            p.types AS types
+        FROM lists la
+        JOIN list_places lpa ON lpa.list_id = la.id
+        JOIN lists lb ON lb.project_id = la.project_id AND lb.slot = 'B'
+        JOIN list_places lpb ON lpb.list_id = lb.id AND lpb.place_id = lpa.place_id
+        JOIN places p ON p.place_id = lpa.place_id
+        WHERE la.slot = 'A';
+
+        CREATE VIEW comparison_only_a AS
+        SELECT
+            la.project_id AS project_id,
+            p.place_id AS place_id,
+            p.name AS name,
+            p.formatted_address AS formatted_address,
+            p.lat AS lat,
+            p.lng AS lng,
+            p.types AS types
+        FROM lists la
+        JOIN list_places lpa ON lpa.list_id = la.id
+        LEFT JOIN lists lb ON lb.project_id = la.project_id AND lb.slot = 'B'
+        LEFT JOIN list_places lpb ON lpb.list_id = lb.id AND lpb.place_id = lpa.place_id
+        JOIN places p ON p.place_id = lpa.place_id
+        WHERE la.slot = 'A' AND lpb.place_id IS NULL;
+
+        CREATE VIEW comparison_only_b AS
+        SELECT
+            lb.project_id AS project_id,
+            p.place_id AS place_id,
+            p.name AS name,
+            p.formatted_address AS formatted_address,
+            p.lat AS lat,
+            p.lng AS lng,
+            p.types AS types
+        FROM lists lb
+        JOIN list_places lpb ON lpb.list_id = lb.id
+        LEFT JOIN lists la ON la.project_id = lb.project_id AND la.slot = 'A'
+        LEFT JOIN list_places lpa ON lpa.list_id = la.id AND lpa.place_id = lpb.place_id
+        JOIN places p ON p.place_id = lpb.place_id
+        WHERE lb.slot = 'B' AND lpa.place_id IS NULL;
+        "#,
     )?;
     seed_default_project(connection)?;
     Ok(())

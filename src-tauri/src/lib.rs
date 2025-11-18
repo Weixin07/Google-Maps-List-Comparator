@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
+use chrono::Utc;
 use csv::WriterBuilder;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
@@ -32,7 +33,10 @@ use tracing::warn;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::commands::FoundationHealth;
-use crate::comparison::{ComparisonSegment, ComparisonSnapshot, PlaceComparisonRow};
+use crate::comparison::{
+    ComparisonPagination, ComparisonSegment, ComparisonSegmentPage, ComparisonSnapshot,
+    PlaceComparisonRow,
+};
 use crate::db::{DatabaseBootstrap, DatabaseContext, DB_KEY_ALIAS};
 use crate::errors::{AppError, AppResult};
 use crate::places::{NormalizationProgress, NormalizationStats, PlaceNormalizer};
@@ -292,6 +296,21 @@ impl AppState {
         Ok(record)
     }
 
+    pub fn rename_comparison_project(
+        &self,
+        project_id: i64,
+        name: String,
+    ) -> AppResult<ComparisonProjectRecord> {
+        let record = {
+            let conn = self.db.lock();
+            projects::rename_project(&conn, project_id, &name)?
+        };
+        if record.is_active {
+            *self.active_project_id.lock() = record.id;
+        }
+        Ok(record)
+    }
+
     pub fn set_active_comparison_project(
         &self,
         project_id: i64,
@@ -328,10 +347,65 @@ impl AppState {
         self.google()?.start_device_flow().await
     }
 
-    pub fn comparison_snapshot(&self, project_id: Option<i64>) -> AppResult<ComparisonSnapshot> {
+    pub fn comparison_snapshot(
+        &self,
+        project_id: Option<i64>,
+        pagination: Option<ComparisonPagination>,
+    ) -> AppResult<ComparisonSnapshot> {
+        let resolved = self.resolve_project_id(project_id)?;
+        let started_at = Utc::now();
+        let timer = std::time::Instant::now();
+        let snapshot = {
+            let conn = self.db.lock();
+            comparison::compute_snapshot(&conn, resolved, pagination)?
+        };
+        let duration_ms = timer.elapsed().as_millis();
+        {
+            let conn = self.db.lock();
+            if let Err(err) = projects::record_comparison_run(
+                &conn,
+                resolved,
+                snapshot.lists.list_a_id,
+                snapshot.lists.list_b_id,
+                &snapshot.stats,
+                started_at.to_rfc3339(),
+                duration_ms,
+            ) {
+                warn!(?err, "failed to persist comparison run history");
+            }
+        }
+        if let Err(err) = self.telemetry.record(
+            "compare_run",
+            json!({
+                "project_id": resolved,
+                "list_a_id": snapshot.lists.list_a_id,
+                "list_b_id": snapshot.lists.list_b_id,
+                "list_a_count": snapshot.stats.list_a_count,
+                "list_b_count": snapshot.stats.list_b_count,
+                "overlap_count": snapshot.stats.overlap_count,
+                "only_a_count": snapshot.stats.only_a_count,
+                "only_b_count": snapshot.stats.only_b_count,
+                "pending_a": snapshot.stats.pending_a,
+                "pending_b": snapshot.stats.pending_b,
+                "page_size": snapshot.overlap.page_size,
+                "page": snapshot.overlap.page,
+                "duration_ms": duration_ms as i64,
+            }),
+        ) {
+            warn!(?err, "failed to record compare_run telemetry");
+        }
+        Ok(snapshot)
+    }
+
+    pub fn comparison_segment_page(
+        &self,
+        project_id: Option<i64>,
+        segment: ComparisonSegment,
+        pagination: ComparisonPagination,
+    ) -> AppResult<ComparisonSegmentPage> {
         let resolved = self.resolve_project_id(project_id)?;
         let conn = self.db.lock();
-        comparison::compute_snapshot(&conn, resolved)
+        comparison::load_segment_page(&conn, resolved, segment, pagination)
     }
 
     pub fn export_comparison_segment(
@@ -345,7 +419,7 @@ impl AppState {
         let resolved = self.resolve_project_id(project_id)?;
         let snapshot = {
             let conn = self.db.lock();
-            comparison::compute_snapshot(&conn, resolved)?
+            comparison::compute_snapshot(&conn, resolved, None)?
         };
         let target_rows = snapshot.rows_for_segment(segment);
         let selection_set = selection.map(|ids| ids.into_iter().collect::<HashSet<_>>());
@@ -1190,8 +1264,10 @@ pub fn run() {
             commands::refresh_place_details,
             commands::cancel_refresh_queue,
             commands::compare_lists,
+            commands::comparison_segment_page,
             commands::list_comparison_projects,
             commands::create_comparison_project,
+            commands::rename_comparison_project,
             commands::set_active_comparison_project,
             commands::map_style_descriptor,
             commands::export_comparison_segment,

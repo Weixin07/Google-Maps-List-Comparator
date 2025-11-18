@@ -48,9 +48,13 @@ vi.mock("@tauri-apps/api/core", () => ({
             pending_a: 0,
             pending_b: 0,
           },
-          overlap: [],
-          only_a: [],
-          only_b: [],
+          lists: {
+            list_a_id: null,
+            list_b_id: null,
+          },
+          overlap: { rows: [], total: 0, page: 1, page_size: 200 },
+          only_a: { rows: [], total: 0, page: 1, page_size: 200 },
+          only_b: { rows: [], total: 0, page: 1, page_size: 200 },
         });
       case "refresh_place_details":
         return Promise.resolve([]);
@@ -63,6 +67,9 @@ vi.mock("@tauri-apps/api/core", () => ({
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
             is_active: true,
+            last_compared_at: null,
+            list_a_id: null,
+            list_b_id: null,
             list_a_imported_at: null,
             list_b_imported_at: null,
           },
@@ -76,6 +83,9 @@ vi.mock("@tauri-apps/api/core", () => ({
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
           is_active: true,
+          last_compared_at: null,
+          list_a_id: null,
+          list_b_id: null,
           list_a_imported_at: null,
           list_b_imported_at: null,
         });
@@ -96,7 +106,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
+  listen: vi.fn().mockResolvedValue(() => { }),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({

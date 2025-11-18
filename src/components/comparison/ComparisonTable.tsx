@@ -22,6 +22,9 @@ type ComparisonTableProps = {
   availableCategories: string[];
   selectedIds: Set<string>;
   focusedPlaceId: string | null;
+  page: number;
+  pageSize: number;
+  isLoading?: boolean;
   onFiltersChange: (segment: ComparisonSegmentKey, filters: TableFilters) => void;
   onSelectionChange: (
     segment: ComparisonSegmentKey,
@@ -29,6 +32,7 @@ type ComparisonTableProps = {
     checked: boolean,
   ) => void;
   onRowFocus: (segment: ComparisonSegmentKey, row: PlaceComparisonRow) => void;
+  onPageChange: (segment: ComparisonSegmentKey, page: number) => void;
 };
 
 export function ComparisonTable({
@@ -41,9 +45,13 @@ export function ComparisonTable({
   availableCategories,
   selectedIds,
   focusedPlaceId,
+  page,
+  pageSize,
+  isLoading,
   onFiltersChange,
   onSelectionChange,
   onRowFocus,
+  onPageChange,
 }: ComparisonTableProps) {
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -77,6 +85,14 @@ export function ComparisonTable({
   const allVisibleSelected =
     sortedRows.length > 0 &&
     sortedRows.every((row) => selectedIds.has(row.place_id));
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / Math.max(1, pageSize)));
+  const currentPage = Math.min(Math.max(1, page), totalPages);
+  const start =
+    totalCount === 0 || sortedRows.length === 0
+      ? 0
+      : (currentPage - 1) * pageSize + 1;
+  const end = sortedRows.length === 0 ? 0 : Math.min(totalCount, start + sortedRows.length - 1);
 
   const handleSearchChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     onFiltersChange(segment, { ...filters, search: event.target.value });
@@ -150,7 +166,8 @@ export function ComparisonTable({
         <div>
           <h3>{title}</h3>
           <p className="muted">
-            Showing {sortedRows.length} of {totalCount} places
+            Showing {start === 0 ? 0 : `${start}-${end}`} of {totalCount} places ·
+            Page {currentPage} of {totalPages}
           </p>
         </div>
         <div className="comparison-table__filters">
@@ -188,6 +205,27 @@ export function ComparisonTable({
           />{" "}
           Select visible
         </label>
+        <div className="comparison-table__pagination">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => onPageChange(segment, Math.max(1, currentPage - 1))}
+            disabled={currentPage <= 1 || Boolean(isLoading)}
+          >
+            Previous
+          </button>
+          <span className="muted">Page {currentPage} of {totalPages}</span>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() =>
+              onPageChange(segment, Math.min(totalPages, currentPage + 1))
+            }
+            disabled={currentPage >= totalPages || Boolean(isLoading)}
+          >
+            Next
+          </button>
+        </div>
         {selectedIds.size > 0 && (
           <button
             type="button"

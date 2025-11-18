@@ -22,17 +22,30 @@ export type PlaceComparisonRow = {
   lists: ListSlot[];
 };
 
+export type ComparisonSegmentPage = {
+  rows: PlaceComparisonRow[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
 export type ComparisonProjectInfo = {
   id: number;
   name: string;
 };
 
+export type ComparisonLists = {
+  list_a_id?: number | null;
+  list_b_id?: number | null;
+};
+
 export type ComparisonSnapshot = {
   project: ComparisonProjectInfo;
   stats: ComparisonStats;
-  overlap: PlaceComparisonRow[];
-  only_a: PlaceComparisonRow[];
-  only_b: PlaceComparisonRow[];
+  lists: ComparisonLists;
+  overlap: ComparisonSegmentPage;
+  only_a: ComparisonSegmentPage;
+  only_b: ComparisonSegmentPage;
 };
 
 export type ComparisonSegmentKey = "overlap" | "only_a" | "only_b";
@@ -44,6 +57,9 @@ export type ComparisonProjectRecord = {
   created_at: string;
   updated_at: string;
   is_active: boolean;
+  last_compared_at?: string | null;
+  list_a_id?: number | null;
+  list_b_id?: number | null;
   list_a_imported_at?: string | null;
   list_b_imported_at?: string | null;
   list_a_drive_file?: DriveFileMetadata | null;

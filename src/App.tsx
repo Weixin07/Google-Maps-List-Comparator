@@ -8,6 +8,7 @@ import type { FoundationHealth, RuntimeSettings } from "./types/foundation";
 import type {
   ComparisonProjectRecord,
   ComparisonSegmentKey,
+  ComparisonSegmentPage,
   ComparisonSnapshot,
   ExportSummary,
   ListSlot,
@@ -197,6 +198,18 @@ const segmentColors: Record<ComparisonSegmentKey, string> = {
   only_a: "#0ea5e9",
   only_b: "#9333ea",
 };
+
+const DEFAULT_PAGE_SIZE = 200;
+const defaultSegmentPages: Record<ComparisonSegmentKey, number> = {
+  overlap: 1,
+  only_a: 1,
+  only_b: 1,
+};
+const defaultSegmentLoading: Record<ComparisonSegmentKey, boolean> = {
+  overlap: false,
+  only_a: false,
+  only_b: false,
+};
 const defaultLayerVisibility: Record<ComparisonSegmentKey, boolean> = {
   overlap: true,
   only_a: true,
@@ -224,6 +237,17 @@ const loadPreferences = (projectId: number): PersistedPreferences | null => {
   } catch {
     return null;
   }
+};
+
+const formatTimestamp = (value?: string | null) => {
+  if (!value) {
+    return "Never compared";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString();
 };
 
 const derivedCategories = [
@@ -309,11 +333,19 @@ function App() {
   const [activeProjectId, setActiveProjectId] = useState<number | null>(null);
   const [isLoadingProjects, setIsLoadingProjects] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
+  const [renameProjectName, setRenameProjectName] = useState("");
+  const [isRenamingProject, setIsRenamingProject] = useState(false);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [filters, setFilters] =
     useState<Record<ComparisonSegmentKey, TableFilters>>(() => initialFilters());
   const [selections, setSelections] =
     useState<Record<ComparisonSegmentKey, Set<string>>>(() => initialSelections());
+  const [segmentPages, setSegmentPages] =
+    useState<Record<ComparisonSegmentKey, number>>(() => ({ ...defaultSegmentPages }));
+  const [segmentLoading, setSegmentLoading] =
+    useState<Record<ComparisonSegmentKey, boolean>>(() => ({
+      ...defaultSegmentLoading,
+    }));
   const [layerVisibility, setLayerVisibility] =
     useState<Record<ComparisonSegmentKey, boolean>>({
       ...defaultLayerVisibility,
@@ -336,6 +368,25 @@ function App() {
       }
     },
     [activeProjectId],
+  );
+  const segmentPageFor = useCallback(
+    (segment: ComparisonSegmentKey) =>
+      comparison ? comparison[segmentPropertyMap[segment]] : null,
+    [comparison],
+  );
+  const rowsForSegment = useCallback(
+    (segment: ComparisonSegmentKey) => segmentPageFor(segment)?.rows ?? [],
+    [segmentPageFor],
+  );
+  const syncSegmentPages = useCallback(
+    (snapshot: ComparisonSnapshot) => {
+      setSegmentPages({
+        overlap: snapshot.overlap.page,
+        only_a: snapshot.only_a.page,
+        only_b: snapshot.only_b.page,
+      });
+    },
+    [],
   );
   const enqueueRefresh = useCallback(
     (target?: ListSlot) => {
@@ -404,6 +455,10 @@ function App() {
     runtimeSettings?.places_rate_limit_qps ??
     foundationHealth?.config.places_rate_limit_qps ??
     1;
+  const activeProject = useMemo(
+    () => projects.find((record) => record.id === activeProjectId) ?? null,
+    [projects, activeProjectId],
+  );
 
   const loadProjects = useCallback(async () => {
     setIsLoadingProjects(true);
@@ -426,23 +481,30 @@ function App() {
     async (projectId?: number | null) => {
       if (!projectId) {
         setComparison(null);
+        setSegmentPages({ ...defaultSegmentPages });
         return;
       }
       setComparisonError(null);
+      setSegmentLoading({ ...defaultSegmentLoading });
       setIsLoadingComparison(true);
       try {
         const snapshot = await invoke<ComparisonSnapshot>("compare_lists", {
           projectId,
+          page: 1,
+          pageSize: DEFAULT_PAGE_SIZE,
         });
         setComparison(snapshot);
+        setSelections(initialSelections());
+        syncSegmentPages(snapshot);
       } catch (error) {
         setComparison(null);
+        setSegmentPages({ ...defaultSegmentPages });
         setComparisonError(normalizeError(error));
       } finally {
         setIsLoadingComparison(false);
       }
     },
-    [],
+    [syncSegmentPages],
   );
 
   useEffect(() => {
@@ -465,6 +527,12 @@ function App() {
   useEffect(() => {
     void loadProjects();
   }, [loadProjects]);
+
+  useEffect(() => {
+    if (activeProject) {
+      setRenameProjectName(activeProject.name);
+    }
+  }, [activeProject]);
 
   const driveEnabled = foundationHealth?.config.drive_import_enabled ?? false;
 
@@ -630,6 +698,8 @@ function App() {
       void loadComparison(activeProjectId);
     } else {
       setComparison(null);
+      setSegmentPages({ ...defaultSegmentPages });
+      setSegmentLoading({ ...defaultSegmentLoading });
     }
   }, [activeProjectId, loadComparison]);
 
@@ -640,6 +710,7 @@ function App() {
     setLayerVisibility(stored?.layerVisibility ?? { ...defaultLayerVisibility });
     setSelections(initialSelections());
     setFocusedPlaceId(null);
+    setSegmentPages({ ...defaultSegmentPages });
     setFocusPoint(null);
     setExportStatus(null);
     setSelectedFiles({ A: null, B: null });
@@ -655,7 +726,7 @@ function App() {
       setSelectedFiles({ A: null, B: null });
       return;
     }
-    const project = projects.find((record) => record.id === activeProjectId);
+    const project = activeProject;
     const resolveSlotSelection = (slot: ListSlot): DriveFileMetadata | null => {
       const stored =
         slot === "A"
@@ -671,7 +742,7 @@ function App() {
       A: resolveSlotSelection("A"),
       B: resolveSlotSelection("B"),
     });
-  }, [activeProjectId, projects, driveFiles]);
+  }, [activeProject, activeProjectId, driveFiles]);
 
   useEffect(() => {
     setSelectionErrors({
@@ -744,16 +815,14 @@ function App() {
         return;
       }
       setFocusedPlaceId(placeId);
-      const allRows = segmentKeys.flatMap(
-        (segment) => comparison[segmentPropertyMap[segment]],
-      ) as PlaceComparisonRow[];
+      const allRows = segmentKeys.flatMap((segment) => rowsForSegment(segment));
       const match = allRows.find((row) => row.place_id === placeId);
       if (match) {
         setFocusPoint({ lng: match.lng, lat: match.lat });
         emitPlaceFocus("map", placeId);
       }
     },
-    [comparison, emitPlaceFocus],
+    [comparison, emitPlaceFocus, rowsForSegment],
   );
 
   const handleLayerToggle = useCallback(
@@ -768,6 +837,46 @@ function App() {
       });
     },
     [filters, persistPreferences],
+  );
+
+  const handleSegmentPageChange = useCallback(
+    async (segment: ComparisonSegmentKey, page: number) => {
+      if (!activeProjectId) {
+        setComparisonError("Create or select a comparison project first.");
+        return;
+      }
+      setSegmentLoading((prev) => ({ ...prev, [segment]: true }));
+      try {
+        const pageData = await invoke<ComparisonSegmentPage>("comparison_segment_page", {
+          projectId: activeProjectId,
+          segment,
+          page,
+          pageSize: DEFAULT_PAGE_SIZE,
+        });
+        setComparison((prev) =>
+          prev
+            ? {
+              ...prev,
+              [segmentPropertyMap[segment]]: pageData,
+            }
+            : prev,
+        );
+        setSelections((prev) => {
+          const next = { ...prev };
+          const allowed = new Set(pageData.rows.map((row) => row.place_id));
+          next[segment] = new Set(
+            Array.from(prev[segment] ?? []).filter((id) => allowed.has(id)),
+          );
+          return next;
+        });
+        setSegmentPages((prev) => ({ ...prev, [segment]: pageData.page }));
+      } catch (error) {
+        setComparisonError(normalizeError(error));
+      } finally {
+        setSegmentLoading((prev) => ({ ...prev, [segment]: false }));
+      }
+    },
+    [activeProjectId],
   );
 
   const handleProjectChange = useCallback(async (projectId: number) => {
@@ -805,6 +914,36 @@ function App() {
     [loadProjects, newProjectName],
   );
 
+  const handleProjectRename = useCallback(
+    async (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!activeProjectId) {
+        setProjectError("Select a project to rename.");
+        return;
+      }
+      if (!renameProjectName.trim()) {
+        setProjectError("Enter a project name to continue.");
+        return;
+      }
+      setIsRenamingProject(true);
+      try {
+        const record = await invoke<ComparisonProjectRecord>("rename_comparison_project", {
+          projectId: activeProjectId,
+          name: renameProjectName.trim(),
+        });
+        await loadProjects();
+        setActiveProjectId(record.id);
+        telemetry.track("project_renamed", { project_id: record.id });
+        setProjectError(null);
+      } catch (error) {
+        setProjectError(normalizeError(error));
+      } finally {
+        setIsRenamingProject(false);
+      }
+    },
+    [activeProjectId, loadProjects, renameProjectName],
+  );
+
   const typeOptions = useMemo(() => {
     const defaults: Record<ComparisonSegmentKey, string[]> = {
       overlap: [],
@@ -815,29 +954,27 @@ function App() {
       return defaults;
     }
     return segmentKeys.reduce((acc, segment) => {
-      const baseRows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      const baseRows = rowsForSegment(segment);
       const unique = new Set<string>();
       baseRows.forEach((row) => row.types.forEach((type) => unique.add(type)));
       acc[segment] = Array.from(unique).sort((a, b) => a.localeCompare(b));
       return acc;
     }, defaults);
-  }, [comparison]);
+  }, [comparison, rowsForSegment]);
 
   const totalCounts = useMemo(() => {
-    const counts: Record<ComparisonSegmentKey, number> = {
-      overlap: 0,
-      only_a: 0,
-      only_b: 0,
-    };
     if (!comparison) {
-      return counts;
+      return {
+        overlap: 0,
+        only_a: 0,
+        only_b: 0,
+      };
     }
-    segmentKeys.forEach((segment) => {
-      counts[segment] = (
-        comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[]
-      ).length;
-    });
-    return counts;
+    return {
+      overlap: comparison.stats.overlap_count,
+      only_a: comparison.stats.only_a_count,
+      only_b: comparison.stats.only_b_count,
+    };
   }, [comparison]);
 
   const categoryOptions = useMemo(() => {
@@ -850,13 +987,13 @@ function App() {
       return defaults;
     }
     return segmentKeys.reduce((acc, segment) => {
-      const rows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      const rows = rowsForSegment(segment);
       const unique = new Set<string>();
       rows.forEach((row) => unique.add(resolveCategory(row.types)));
       acc[segment] = Array.from(unique).sort((a, b) => a.localeCompare(b));
       return acc;
     }, defaults);
-  }, [comparison]);
+  }, [comparison, rowsForSegment]);
 
   const categoryMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -864,13 +1001,13 @@ function App() {
       return map;
     }
     segmentKeys.forEach((segment) => {
-      const rows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      const rows = rowsForSegment(segment);
       rows.forEach((row) => {
         map.set(row.place_id, resolveCategory(row.types));
       });
     });
     return map;
-  }, [comparison]);
+  }, [comparison, rowsForSegment]);
 
   const filteredRows = useMemo(() => {
     const defaults: Record<ComparisonSegmentKey, PlaceComparisonRow[]> = {
@@ -882,7 +1019,7 @@ function App() {
       return defaults;
     }
     return segmentKeys.reduce((acc, segment) => {
-      const baseRows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      const baseRows = rowsForSegment(segment);
       const search = filters[segment].search.trim().toLowerCase();
       const typeFilter = filters[segment].type;
       const categoryFilter = filters[segment].category;
@@ -901,7 +1038,7 @@ function App() {
       });
       return acc;
     }, defaults);
-  }, [categoryMap, comparison, filters]);
+  }, [categoryMap, comparison, filters, rowsForSegment]);
 
   const mapData = useMemo(() => {
     return segmentKeys.reduce((acc, segment) => {
@@ -924,7 +1061,7 @@ function App() {
         setComparisonError("Import data before exporting.");
         return;
       }
-      const baseRows = comparison[segmentPropertyMap[segment]] as PlaceComparisonRow[];
+      const baseRows = rowsForSegment(segment);
       const visibleRows = filteredRows[segment];
       const selectedValues = Array.from(selections[segment]);
       const placeIds =
@@ -970,6 +1107,7 @@ function App() {
       exportFormat,
       filteredRows,
       selections,
+      rowsForSegment,
     ],
   );
 
@@ -1740,6 +1878,33 @@ function App() {
               </button>
             </div>
           </form>
+          <form className="project-create" onSubmit={handleProjectRename}>
+            <label htmlFor="rename-project">Rename active</label>
+            <div className="project-create__controls">
+              <input
+                id="rename-project"
+                type="text"
+                value={renameProjectName}
+                placeholder="Rename active project"
+                onChange={(event) => setRenameProjectName(event.target.value)}
+                disabled={!activeProjectId}
+              />
+              <button
+                type="submit"
+                className="secondary-button"
+                disabled={
+                  !activeProjectId ||
+                  renameProjectName.trim().length === 0 ||
+                  isRenamingProject
+                }
+              >
+                Save
+              </button>
+            </div>
+            <p className="muted">
+              Last compared: {formatTimestamp(activeProject?.last_compared_at)}
+            </p>
+          </form>
         </div>
         {projectError && <p className="error-text">{projectError}</p>}
         <div className="comparison-actions">
@@ -1877,9 +2042,13 @@ function App() {
                     availableCategories={categoryOptions[segment]}
                     selectedIds={selections[segment]}
                     focusedPlaceId={focusedPlaceId}
+                    page={segmentPages[segment]}
+                    pageSize={segmentPageFor(segment)?.page_size ?? DEFAULT_PAGE_SIZE}
+                    isLoading={segmentLoading[segment] || isLoadingComparison}
                     onFiltersChange={handleFiltersChange}
                     onSelectionChange={handleSelectionChange}
                     onRowFocus={handleRowFocus}
+                    onPageChange={handleSegmentPageChange}
                   />
                 ))}
               </div>
