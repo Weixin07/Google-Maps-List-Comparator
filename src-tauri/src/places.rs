@@ -16,7 +16,7 @@ use tracing::{trace, warn};
 
 use crate::config::AppConfig;
 use crate::errors::{AppError, AppResult};
-use crate::ingestion::{ListSlot, NormalizedRow};
+use crate::ingestion::{ListSlot, NormalizedRow, ParsedRow};
 
 const GEO_EPSILON: f64 = 0.00001;
 const MAX_ATTEMPTS: u32 = 5;
@@ -224,13 +224,8 @@ impl PlaceNormalizer {
         let mut results = Vec::new();
         for slot in slots {
             results.push(
-                self.normalize_slot(
-                    project_id,
-                    *slot,
-                    observer.clone(),
-                    cancel_flag.clone(),
-                )
-                .await?,
+                self.normalize_slot(project_id, *slot, observer.clone(), cancel_flag.clone())
+                    .await?,
             );
         }
         Ok(results)
@@ -265,6 +260,18 @@ impl PlaceNormalizer {
 
         let mut rows = Vec::with_capacity(raw_rows.len());
         for (hash, payload) in raw_rows {
+            if let Ok(parsed) = serde_json::from_str::<ParsedRow>(&payload) {
+                rows.push(RawRow {
+                    source_hash: if parsed.source_row_hash.is_empty() {
+                        hash.clone()
+                    } else {
+                        parsed.source_row_hash.clone()
+                    },
+                    row: parsed.normalized,
+                });
+                continue;
+            }
+
             let normalized: NormalizedRow = serde_json::from_str(&payload)?;
             rows.push(RawRow {
                 source_hash: hash,
@@ -836,6 +843,7 @@ mod tests {
                     altitude: None,
                     place_id: None,
                     raw_coordinates: "1,2,0".into(),
+                    layer_path: None,
                 })
                 .unwrap()],
             )
@@ -902,6 +910,7 @@ mod tests {
                     altitude: None,
                     place_id: None,
                     raw_coordinates: "1,2,0".into(),
+                    layer_path: None,
                 })
                 .unwrap()],
             )

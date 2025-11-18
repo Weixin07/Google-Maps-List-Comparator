@@ -44,6 +44,12 @@ type ImportProgressPayload = {
   error?: string | null;
   file_name?: string | null;
   details?: string[] | null;
+  processed_rows?: number | null;
+  total_rows?: number | null;
+  rejected_rows?: number | null;
+  bytes_downloaded?: number | null;
+  expected_bytes?: number | null;
+  checksum?: string | null;
 };
 
 type RefreshProgressPayload = {
@@ -91,6 +97,12 @@ type ImportState = {
   errorDetails?: string[];
   attemptId?: string;
   startedAt?: number;
+  processedRows?: number;
+  totalRows?: number;
+  rejectedRows?: number;
+  downloadedBytes?: number;
+  expectedBytes?: number;
+  checksum?: string;
   history: ImportAttemptRecord[];
 };
 
@@ -541,6 +553,12 @@ function App() {
             history: nextHistory,
             attemptId: isTerminal ? undefined : attemptId,
             startedAt: isTerminal ? undefined : startedAt,
+            processedRows: event.payload.processed_rows ?? previous.processedRows,
+            totalRows: event.payload.total_rows ?? previous.totalRows,
+            rejectedRows: event.payload.rejected_rows ?? previous.rejectedRows,
+            downloadedBytes: event.payload.bytes_downloaded ?? previous.downloadedBytes,
+            expectedBytes: event.payload.expected_bytes ?? previous.expectedBytes,
+            checksum: event.payload.checksum ?? previous.checksum,
           },
         };
       });
@@ -1277,6 +1295,12 @@ function App() {
             errorDetails: undefined,
             attemptId: undefined,
             startedAt: undefined,
+            processedRows: undefined,
+            totalRows: undefined,
+            rejectedRows: undefined,
+            downloadedBytes: undefined,
+            expectedBytes: undefined,
+            checksum: undefined,
           },
         }));
         return;
@@ -1294,6 +1318,12 @@ function App() {
             errorDetails: validationMessage ? [validationMessage] : undefined,
             attemptId: undefined,
             startedAt: undefined,
+            processedRows: undefined,
+            totalRows: undefined,
+            rejectedRows: undefined,
+            downloadedBytes: undefined,
+            expectedBytes: undefined,
+            checksum: undefined,
           },
         }));
         return;
@@ -1312,6 +1342,12 @@ function App() {
           errorDetails: undefined,
           attemptId,
           startedAt: Date.now(),
+          processedRows: undefined,
+          totalRows: undefined,
+          rejectedRows: undefined,
+          downloadedBytes: undefined,
+          expectedBytes: undefined,
+          checksum: undefined,
         },
       }));
 
@@ -1331,6 +1367,7 @@ function App() {
           mimeType: file.mime_type,
           modifiedTime: file.modified_time,
           size: file.size,
+          md5Checksum: file.md5_checksum,
         });
         const hash = await fileHashPromise;
         if (hash) {
@@ -2091,6 +2128,22 @@ function App() {
                         />
                       </div>
                       <p className="progress-copy">{imports[slot].message}</p>
+                      {imports[slot].totalRows != null && (
+                        <p className="muted">
+                          Rows {imports[slot].processedRows ?? 0}/{imports[slot].totalRows}
+                          {imports[slot].rejectedRows
+                            ? ` (${imports[slot].rejectedRows} rejected)`
+                            : ""}
+                        </p>
+                      )}
+                      {imports[slot].downloadedBytes != null && (
+                        <p className="muted">
+                          Downloaded {formatBytes(imports[slot].downloadedBytes) ?? `${imports[slot].downloadedBytes} B`}
+                          {imports[slot].expectedBytes
+                            ? ` of ${formatBytes(imports[slot].expectedBytes) ?? `${imports[slot].expectedBytes} B`}`
+                            : ""}
+                        </p>
+                      )}
                       {imports[slot].error && (
                         <div className="import-error">
                           <p className="error-text">{imports[slot].error}</p>

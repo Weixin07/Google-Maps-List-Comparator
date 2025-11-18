@@ -24,6 +24,7 @@ pub struct DriveFileRecord {
     pub mime_type: Option<String>,
     pub modified_time: Option<String>,
     pub size: Option<u64>,
+    pub md5_checksum: Option<String>,
 }
 
 pub fn active_project_id(connection: &Connection) -> AppResult<i64> {
@@ -52,11 +53,13 @@ pub fn list_projects(connection: &Connection) -> AppResult<Vec<ComparisonProject
             la.drive_file_mime AS list_a_drive_file_mime,
             la.drive_file_size AS list_a_drive_file_size,
             la.drive_modified_time AS list_a_drive_modified_time,
+            la.drive_file_checksum AS list_a_drive_checksum,
             lb.drive_file_id AS list_b_drive_file_id,
             lb.drive_file_name AS list_b_drive_file_name,
             lb.drive_file_mime AS list_b_drive_file_mime,
             lb.drive_file_size AS list_b_drive_file_size,
-            lb.drive_modified_time AS list_b_drive_modified_time
+            lb.drive_modified_time AS list_b_drive_modified_time,
+            lb.drive_file_checksum AS list_b_drive_checksum
         FROM comparison_projects cp
         LEFT JOIN lists la ON la.project_id = cp.id AND la.slot = 'A'
         LEFT JOIN lists lb ON lb.project_id = cp.id AND lb.slot = 'B'
@@ -88,11 +91,13 @@ pub fn project_by_id(
                 la.drive_file_mime AS list_a_drive_file_mime,
                 la.drive_file_size AS list_a_drive_file_size,
                 la.drive_modified_time AS list_a_drive_modified_time,
+                la.drive_file_checksum AS list_a_drive_checksum,
                 lb.drive_file_id AS list_b_drive_file_id,
                 lb.drive_file_name AS list_b_drive_file_name,
                 lb.drive_file_mime AS list_b_drive_file_mime,
                 lb.drive_file_size AS list_b_drive_file_size,
-                lb.drive_modified_time AS list_b_drive_modified_time
+                lb.drive_modified_time AS list_b_drive_modified_time,
+                lb.drive_file_checksum AS list_b_drive_checksum
             FROM comparison_projects cp
             LEFT JOIN lists la ON la.project_id = cp.id AND la.slot = 'A'
             LEFT JOIN lists lb ON lb.project_id = cp.id AND lb.slot = 'B'
@@ -190,7 +195,7 @@ fn slugify(name: &str) -> String {
 fn project_from_row(row: &Row<'_>) -> ComparisonProjectRecord {
     let is_active: i64 = row.get(5).unwrap_or(0);
     let list_a_drive_file = drive_file_from_row(row, 8);
-    let list_b_drive_file = drive_file_from_row(row, 13);
+    let list_b_drive_file = drive_file_from_row(row, 14);
     ComparisonProjectRecord {
         id: row.get(0).unwrap_or_default(),
         name: row.get(1).unwrap_or_default(),
@@ -211,11 +216,13 @@ fn drive_file_from_row(row: &Row<'_>, start_index: usize) -> Option<DriveFileRec
     let mime_type: Option<String> = row.get(start_index + 2).unwrap_or(None);
     let size: Option<i64> = row.get(start_index + 3).unwrap_or(None);
     let modified_time: Option<String> = row.get(start_index + 4).unwrap_or(None);
+    let checksum: Option<String> = row.get(start_index + 5).unwrap_or(None);
     drive_id.map(|id| DriveFileRecord {
         name: name.unwrap_or_else(|| id.clone()),
         id,
         mime_type,
         modified_time,
         size: size.and_then(|value| value.try_into().ok()),
+        md5_checksum: checksum,
     })
 }

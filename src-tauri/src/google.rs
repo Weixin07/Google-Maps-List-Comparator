@@ -4,6 +4,7 @@ use std::time::Duration as StdDuration;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Duration, Utc};
 use futures_util::StreamExt;
+use md5;
 use parking_lot::Mutex;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
@@ -32,6 +33,8 @@ const DEFAULT_WAIT_SECS: u64 = 5;
 const DEFAULT_LOOPBACK_TIMEOUT_SECS: u64 = 180;
 const LOOPBACK_PATH: &str = "/auth/callback";
 const LOOPBACK_HOST: &str = "127.0.0.1";
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
+const DOWNLOAD_RETRY_DELAY_MS: u64 = 500;
 
 const GOOGLE_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/drive.readonly",
@@ -95,6 +98,15 @@ pub struct DriveFileMetadata {
     pub mime_type: String,
     pub modified_time: Option<String>,
     pub size: Option<u64>,
+    pub md5_checksum: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadedFile {
+    pub bytes: Vec<u8>,
+    pub checksum_md5: String,
+    pub received_bytes: u64,
+    pub expected_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +158,7 @@ impl From<DriveFileRaw> for DriveFileMetadata {
             mime_type: value.mime_type,
             modified_time: value.modified_time,
             size: value.size.and_then(|s| s.parse().ok()),
+            md5_checksum: value.md5_checksum,
         }
     }
 }
@@ -518,7 +531,7 @@ impl GoogleServices {
                     )
                     .append_pair(
                         "fields",
-                        "nextPageToken, files(id,name,mimeType,modifiedTime,size)",
+                        "nextPageToken, files(id,name,mimeType,modifiedTime,size,md5Checksum)",
                     )
                     .append_pair("orderBy", "modifiedTime desc")
                     .append_pair("pageSize", &page_size.to_string());
@@ -559,8 +572,54 @@ impl GoogleServices {
         &self,
         file_id: &str,
         mime_type: Option<&str>,
+        expected_size: Option<u64>,
+        expected_md5: Option<&str>,
         mut progress: F,
-    ) -> AppResult<Vec<u8>>
+    ) -> AppResult<DownloadedFile>
+    where
+        F: FnMut(u64, Option<u64>) + Send,
+    {
+        let mut attempt = 0;
+        let mut last_err: Option<AppError> = None;
+        while attempt < MAX_DOWNLOAD_ATTEMPTS {
+            attempt += 1;
+            let result = self
+                .download_once(
+                    file_id,
+                    mime_type,
+                    expected_size,
+                    expected_md5,
+                    &mut progress,
+                )
+                .await;
+            match result {
+                Ok(file) => return Ok(file),
+                Err(err) => {
+                    let retryable = should_retry_download(&err);
+                    if !retryable || attempt >= MAX_DOWNLOAD_ATTEMPTS {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                    sleep(StdDuration::from_millis(
+                        DOWNLOAD_RETRY_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                    progress(0, expected_size);
+                }
+            }
+        }
+
+        Err(last_err.expect("download attempts always produce an error on failure"))
+    }
+
+    async fn download_once<F>(
+        &self,
+        file_id: &str,
+        mime_type: Option<&str>,
+        expected_size: Option<u64>,
+        expected_md5: Option<&str>,
+        progress: &mut F,
+    ) -> AppResult<DownloadedFile>
     where
         F: FnMut(u64, Option<u64>) + Send,
     {
@@ -598,8 +657,9 @@ impl GoogleServices {
         }
         let response = response.error_for_status()?;
 
-        let total = response.content_length();
-        progress(0, total);
+        let declared_total = response.content_length();
+        let target_total = declared_total.or(expected_size);
+        progress(0, target_total);
 
         let mut stream = response.bytes_stream();
         let mut downloaded = 0_u64;
@@ -609,10 +669,41 @@ impl GoogleServices {
             let chunk = chunk?;
             downloaded += chunk.len() as u64;
             buffer.extend_from_slice(&chunk);
-            progress(downloaded, total);
+            progress(downloaded, target_total);
         }
 
-        Ok(buffer)
+        if let Some(expected) = target_total {
+            if downloaded != expected {
+                return Err(AppError::Parse(format!(
+                    "downloaded size mismatch (expected {expected} bytes, got {downloaded})"
+                )));
+            }
+        }
+
+        if let Some(metadata_size) = expected_size {
+            if downloaded != metadata_size {
+                return Err(AppError::Parse(format!(
+                    "downloaded size mismatch (metadata {metadata_size} bytes, got {downloaded})"
+                )));
+            }
+        }
+
+        let checksum = format!("{:x}", md5::compute(&buffer));
+        if let Some(expected) = expected_md5 {
+            let trimmed = expected.trim();
+            if !trimmed.is_empty() && checksum.to_lowercase() != trimmed.to_lowercase() {
+                return Err(AppError::Parse(format!(
+                    "download checksum mismatch (expected {trimmed}, got {checksum})"
+                )));
+            }
+        }
+
+        Ok(DownloadedFile {
+            bytes: buffer,
+            checksum_md5: checksum,
+            received_bytes: downloaded,
+            expected_bytes: target_total,
+        })
     }
 
     async fn exchange_code_for_token(
@@ -936,6 +1027,8 @@ struct DriveFileRaw {
     #[serde(rename = "modifiedTime")]
     modified_time: Option<String>,
     size: Option<String>,
+    #[serde(rename = "md5Checksum")]
+    md5_checksum: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -961,5 +1054,24 @@ fn drive_auth_error(status: StatusCode) -> Option<AppError> {
         ))
     } else {
         None
+    }
+}
+
+fn should_retry_download(err: &AppError) -> bool {
+    match err {
+        AppError::Http(http_err) => {
+            if let Some(status) = http_err.status() {
+                status.is_server_error()
+                    || status == StatusCode::TOO_MANY_REQUESTS
+                    || status == StatusCode::REQUEST_TIMEOUT
+            } else {
+                http_err.is_timeout() || http_err.is_connect()
+            }
+        }
+        AppError::Parse(reason) => {
+            let lower = reason.to_ascii_lowercase();
+            lower.contains("mismatch") || lower.contains("checksum")
+        }
+        _ => false,
     }
 }

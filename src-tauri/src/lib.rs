@@ -49,7 +49,10 @@ pub use db::bootstrap;
 pub use google::{
     DeviceFlowState, DriveFileMetadata, GoogleIdentity, GoogleServices, LoopbackFlowState,
 };
-pub use ingestion::{enqueue_place_hashes, parse_kml, persist_rows, ImportSummary, ListSlot};
+pub use ingestion::{
+    enqueue_place_hashes, parse_kml, persist_rows, ImportSummary, ListSlot, ParsedKml, ParsedRow,
+    RejectedPlacemark,
+};
 pub use secrets::SecretVault;
 pub use telemetry::TelemetryClient;
 
@@ -62,6 +65,18 @@ pub struct ImportProgressPayload {
     pub file_name: Option<String>,
     pub error: Option<String>,
     pub details: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processed_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_downloaded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
 }
 
 impl ImportProgressPayload {
@@ -80,6 +95,12 @@ impl ImportProgressPayload {
             file_name,
             error: None,
             details: None,
+            processed_rows: None,
+            total_rows: None,
+            rejected_rows: None,
+            bytes_downloaded: None,
+            expected_bytes: None,
+            checksum: None,
         }
     }
 
@@ -98,6 +119,12 @@ impl ImportProgressPayload {
             file_name,
             error: Some(summary),
             details,
+            processed_rows: None,
+            total_rows: None,
+            rejected_rows: None,
+            bytes_downloaded: None,
+            expected_bytes: None,
+            checksum: None,
         }
     }
 }
@@ -456,6 +483,7 @@ impl AppState {
         mime_type: Option<String>,
         modified_time: Option<String>,
         size: Option<u64>,
+        md5_checksum: Option<String>,
     ) -> AppResult<ImportSummary> {
         let resolved_project = self.resolve_project_id(project_id)?;
         let file_hash = fingerprint(&file_id);
@@ -465,6 +493,7 @@ impl AppState {
             mime_type: mime_type.unwrap_or_else(|| "application/vnd.google-earth.kml+xml".into()),
             modified_time,
             size,
+            md5_checksum,
         };
         {
             let mut conn = self.db.lock();
@@ -669,6 +698,8 @@ impl AppState {
             json!({
                 "slot": slot.as_tag(),
                 "file_hash": file_hash.clone(),
+                "file_size": drive_file.size,
+                "mime_type": drive_file.mime_type,
             }),
         ) {
             warn!(?err, "failed to record drive_file_selected telemetry");
@@ -679,71 +710,147 @@ impl AppState {
                 "slot": slot.as_tag(),
                 "file_hash": file_hash.clone(),
                 "file_name": drive_file.name.clone(),
+                "file_size": drive_file.size,
+                "checksum": drive_file.md5_checksum,
             }),
         ) {
             warn!(?err, "failed to record import_started telemetry");
         }
 
-        self.notify_progress(ImportProgressPayload::new(
+        let expected_bytes = drive_file.size;
+        let mut initial_progress = ImportProgressPayload::new(
             slot,
             "download",
             format!("Downloading {}", drive_file.name),
             0.0,
             Some(drive_file.name.clone()),
-        ));
+        );
+        initial_progress.expected_bytes = expected_bytes;
+        self.notify_progress(initial_progress);
 
         let progress_label = drive_file.name.clone();
         let mut progress_cb = |received: u64, total: Option<u64>| {
-            let pct = total
-                .and_then(|t| {
-                    if t == 0 {
-                        None
-                    } else {
-                        Some(received as f32 / t as f32)
-                    }
-                })
-                .unwrap_or(0.0);
-            self.notify_progress(ImportProgressPayload::new(
+            let total_bytes = total.or(expected_bytes).filter(|value| *value > 0);
+            let pct = total_bytes
+                .map(|t| received as f32 / t as f32)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let mut payload = ImportProgressPayload::new(
                 slot,
                 "download",
                 format!("Downloading {}", progress_label),
                 (pct * 0.6).clamp(0.0, 0.6),
                 Some(progress_label.clone()),
-            ));
+            );
+            payload.bytes_downloaded = Some(received);
+            payload.expected_bytes = total_bytes;
+            self.notify_progress(payload);
         };
 
         let downloader = self.google()?.clone();
-        let bytes = downloader
+        let download = downloader
             .download_file(
                 &drive_file.id,
                 Some(&drive_file.mime_type),
+                expected_bytes,
+                drive_file.md5_checksum.as_deref(),
                 &mut progress_cb,
             )
             .await?;
 
-        self.notify_progress(ImportProgressPayload::new(
+        let mut parse_progress = ImportProgressPayload::new(
             slot,
             "parse",
             "Parsing KML data",
             0.65,
             Some(drive_file.name.clone()),
-        ));
+        );
+        parse_progress.bytes_downloaded = Some(download.received_bytes);
+        parse_progress.expected_bytes = download.expected_bytes.or(expected_bytes);
+        parse_progress.checksum = Some(download.checksum_md5.clone());
+        self.notify_progress(parse_progress);
 
-        let rows = parse_kml(&bytes)?;
-        self.notify_progress(ImportProgressPayload::new(
+        let parsed = parse_kml(&download.bytes)?;
+        let total_rows = parsed.rows.len();
+        let rejected_rows = parsed.rejected.len();
+        let persist_message = if rejected_rows > 0 {
+            format!(
+                "Persisting {} rows ({} rejected)",
+                total_rows, rejected_rows
+            )
+        } else {
+            format!("Persisting {} rows", total_rows)
+        };
+        let mut persist_progress = ImportProgressPayload::new(
             slot,
             "persist",
-            format!("Persisting {} rows", rows.len()),
-            0.85,
+            persist_message,
+            0.72,
             Some(drive_file.name.clone()),
-        ));
+        );
+        persist_progress.total_rows = Some(total_rows);
+        persist_progress.rejected_rows = Some(rejected_rows);
+        persist_progress.bytes_downloaded = Some(download.received_bytes);
+        persist_progress.expected_bytes = download.expected_bytes.or(expected_bytes);
+        persist_progress.checksum = Some(download.checksum_md5.clone());
+        self.notify_progress(persist_progress);
+
+        if rejected_rows > 0 {
+            let examples: Vec<String> = parsed
+                .rejected
+                .iter()
+                .take(3)
+                .map(|entry| entry.message.clone())
+                .collect();
+            if let Err(err) = self.telemetry.record(
+                "kml_rows_rejected",
+                json!({
+                    "slot": slot.as_tag(),
+                    "file_hash": file_hash.clone(),
+                    "rejected": rejected_rows,
+                    "kept": total_rows,
+                    "examples": examples,
+                }),
+            ) {
+                warn!(?err, "failed to record kml_rows_rejected telemetry");
+            }
+            warn!(
+                slot = slot.as_tag(),
+                rejected_rows,
+                kept_rows = total_rows,
+                "skipped malformed placemarks during parse"
+            );
+        }
 
         let summary = {
             let mut conn = self.db.lock();
-            persist_rows(&mut conn, project_id, slot, &drive_file, &rows)?
+            ingestion::persist_rows_with_progress(
+                &mut conn,
+                project_id,
+                slot,
+                &drive_file,
+                &parsed.rows,
+                Some(|processed, total| {
+                    let pct = if total == 0 {
+                        0.0
+                    } else {
+                        processed as f32 / total as f32
+                    };
+                    let mut payload = ImportProgressPayload::new(
+                        slot,
+                        "persist",
+                        format!("Persisting {processed}/{total} rows"),
+                        0.72 + (pct * 0.15),
+                        Some(progress_label.clone()),
+                    );
+                    payload.processed_rows = Some(processed);
+                    payload.total_rows = Some(total);
+                    self.notify_progress(payload);
+                }),
+            )?
         };
 
-        enqueue_place_hashes(&self.telemetry, slot, &rows)?;
+        enqueue_place_hashes(&self.telemetry, slot, &parsed.rows)?;
 
         self.notify_progress(ImportProgressPayload::new(
             slot,
@@ -761,7 +868,20 @@ impl AppState {
         self.notify_progress(ImportProgressPayload::new(
             slot,
             "complete",
-            format!("Imported {} rows for {}", rows.len(), slot.display_name()),
+            if rejected_rows > 0 {
+                format!(
+                    "Imported {} rows for {} ({} rejected)",
+                    parsed.rows.len(),
+                    slot.display_name(),
+                    rejected_rows
+                )
+            } else {
+                format!(
+                    "Imported {} rows for {}",
+                    parsed.rows.len(),
+                    slot.display_name()
+                )
+            },
             1.0,
             Some(drive_file.name.clone()),
         ));
@@ -771,7 +891,10 @@ impl AppState {
             json!({
                 "slot": slot.as_tag(),
                 "file_hash": file_hash,
-                "rows": rows.len(),
+                "rows": parsed.rows.len(),
+                "rejected_rows": rejected_rows,
+                "bytes_downloaded": download.received_bytes,
+                "checksum": download.checksum_md5,
                 "normalized_rows": normalization.resolved,
                 "cache_hits": normalization.cache_hits,
                 "places_calls": normalization.places_calls,

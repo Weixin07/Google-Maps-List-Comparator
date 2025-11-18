@@ -30,6 +30,7 @@ const SAMPLE_KML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 #[tokio::test]
 async fn device_flow_and_import_roundtrip() {
     let server = Server::run();
+    let sample_md5 = format!("{:x}", md5::compute(SAMPLE_KML.as_bytes()));
 
     server.expect(
         Expectation::matching(all_of!(
@@ -76,7 +77,8 @@ async fn device_flow_and_import_roundtrip() {
                 "name": "List A",
                 "mimeType": "application/vnd.google-earth.kml+xml",
                 "modifiedTime": "2024-01-01T00:00:00Z",
-                "size": "128"
+                "size": SAMPLE_KML.len().to_string(),
+                "md5Checksum": sample_md5
             }]
         }))),
     );
@@ -127,18 +129,24 @@ async fn device_flow_and_import_roundtrip() {
     assert_eq!(files.len(), 1);
 
     let mut checkpoints = Vec::new();
-    let bytes = google
-        .download_file("drive-file", None, |received, total| {
-            checkpoints.push((received, total));
-        })
+    let download = google
+        .download_file(
+            "drive-file",
+            None,
+            Some(SAMPLE_KML.len() as u64),
+            Some(sample_md5.as_str()),
+            |received, total| {
+                checkpoints.push((received, total));
+            },
+        )
         .await
         .expect("download");
     assert!(!checkpoints.is_empty());
-    let text = String::from_utf8(bytes.clone()).expect("utf8 kml");
+    let text = String::from_utf8(download.bytes.clone()).expect("utf8 kml");
     assert!(text.contains("<kml"));
 
-    let rows = parse_kml(&bytes).expect("parse rows");
-    assert_eq!(rows.len(), 1);
+    let parsed = parse_kml(&download.bytes).expect("parse rows");
+    assert_eq!(parsed.rows.len(), 1);
 
     let dir = tempdir().unwrap();
     let bootstrap_ctx = bootstrap(dir.path(), "import.db", &vault).expect("bootstrap db");
@@ -155,12 +163,19 @@ async fn device_flow_and_import_roundtrip() {
         name: "List A".into(),
         mime_type: "application/vnd.google-earth.kml+xml".into(),
         modified_time: Some("2024-01-01T00:00:00Z".into()),
-        size: Some(128),
+        size: Some(SAMPLE_KML.len() as u64),
+        md5_checksum: Some(sample_md5),
     };
-    let summary = persist_rows(&mut connection, project_id, ListSlot::A, &drive_file, &rows)
-        .expect("persist rows");
+    let summary = persist_rows(
+        &mut connection,
+        project_id,
+        ListSlot::A,
+        &drive_file,
+        &parsed.rows,
+    )
+    .expect("persist rows");
     assert_eq!(summary.row_count, 1);
 
     let telemetry = TelemetryClient::new(dir.path(), &config).expect("telemetry");
-    enqueue_place_hashes(&telemetry, ListSlot::A, &rows).expect("hash telemetry");
+    enqueue_place_hashes(&telemetry, ListSlot::A, &parsed.rows).expect("hash telemetry");
 }

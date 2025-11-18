@@ -232,6 +232,7 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
     ensure_column(connection, "lists", "drive_file_mime TEXT")?;
     ensure_column(connection, "lists", "drive_file_size INTEGER")?;
     ensure_column(connection, "lists", "drive_modified_time TEXT")?;
+    ensure_column(connection, "lists", "drive_file_checksum TEXT")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_places_lat_lng ON places(lat, lng)",
         [],

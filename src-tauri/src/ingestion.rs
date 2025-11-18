@@ -48,6 +48,8 @@ pub struct NormalizedRow {
     pub altitude: Option<f64>,
     pub place_id: Option<String>,
     pub raw_coordinates: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_path: Option<String>,
 }
 
 impl NormalizedRow {
@@ -69,6 +71,53 @@ impl NormalizedRow {
             hasher.update(self.longitude.to_le_bytes());
         }
         STANDARD_NO_PAD.encode(hasher.finalize())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawPlacemark {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub coordinates: Option<String>,
+    pub place_id: Option<String>,
+    pub altitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedRow {
+    pub normalized: NormalizedRow,
+    pub original: RawPlacemark,
+    pub source_row_hash: String,
+}
+
+impl ParsedRow {
+    fn new(normalized: NormalizedRow, original: RawPlacemark) -> Self {
+        let source_row_hash = normalized.source_hash();
+        Self {
+            normalized,
+            original,
+            source_row_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedPlacemark {
+    pub message: String,
+    pub raw: RawPlacemark,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedKml {
+    pub rows: Vec<ParsedRow>,
+    pub rejected: Vec<RejectedPlacemark>,
+}
+
+impl ParsedKml {
+    fn new(rows: Vec<ParsedRow>, rejected: Vec<RejectedPlacemark>) -> Self {
+        Self { rows, rejected }
     }
 }
 
@@ -112,14 +161,16 @@ pub fn persist_drive_selection(
                     drive_file_mime = ?3,
                     drive_file_size = ?4,
                     drive_modified_time = ?5,
-                    name = ?6
-                WHERE id = ?7",
+                    drive_file_checksum = ?6,
+                    name = ?7
+                WHERE id = ?8",
                 (
                     file.id.as_str(),
                     file.name.as_str(),
                     file.mime_type.as_str(),
                     file.size.map(|value| value as i64),
                     file.modified_time.clone(),
+                    file.md5_checksum.clone(),
                     slot.display_name(),
                     list_id,
                 ),
@@ -132,7 +183,8 @@ pub fn persist_drive_selection(
                     drive_file_name = NULL,
                     drive_file_mime = NULL,
                     drive_file_size = NULL,
-                    drive_modified_time = NULL
+                    drive_modified_time = NULL,
+                    drive_file_checksum = NULL
                 WHERE id = ?1",
                 [list_id],
             )?;
@@ -141,23 +193,58 @@ pub fn persist_drive_selection(
     Ok(list_id)
 }
 
-pub fn parse_kml(bytes: &[u8]) -> AppResult<Vec<NormalizedRow>> {
+pub fn parse_kml(bytes: &[u8]) -> AppResult<ParsedKml> {
     let xml = std::str::from_utf8(bytes)
         .map_err(|err| AppError::Parse(format!("invalid UTF-8 in KML: {err}")))?;
     let document =
         Document::parse(xml).map_err(|err| AppError::Parse(format!("invalid KML: {err}")))?;
 
     let mut rows = Vec::new();
+    let mut rejected = Vec::new();
     for placemark in document
         .descendants()
         .filter(|node| node.tag_name().name() == "Placemark")
     {
-        if let Some(row) = parse_placemark(placemark)? {
-            rows.push(row);
+        let raw = extract_raw_placemark(placemark);
+        let coordinates = match raw.coordinates.clone() {
+            Some(value) => value,
+            None => {
+                rejected.push(RejectedPlacemark {
+                    message: "Placemark missing coordinates".into(),
+                    raw,
+                });
+                continue;
+            }
+        };
+
+        let mut raw_entry = raw;
+        match parse_coordinates(&coordinates) {
+            Some((longitude, latitude, altitude)) => {
+                let normalized = NormalizedRow {
+                    title: normalize_label(raw_entry.name.as_deref())
+                        .unwrap_or_else(|| "Untitled placemark".to_string()),
+                    description: normalize_text(raw_entry.description.as_deref()),
+                    longitude: normalize_coordinate(longitude),
+                    latitude: normalize_coordinate(latitude),
+                    altitude,
+                    place_id: raw_entry.place_id.clone(),
+                    raw_coordinates: coordinates,
+                    layer_path: raw_entry.layer_path.clone(),
+                };
+                raw_entry.altitude = altitude;
+                rows.push(ParsedRow::new(normalized, raw_entry));
+            }
+            None => {
+                rejected.push(RejectedPlacemark {
+                    message: "Placemark missing valid coordinates".into(),
+                    raw: raw_entry,
+                });
+                continue;
+            }
         }
     }
 
-    Ok(rows)
+    Ok(ParsedKml::new(rows, rejected))
 }
 
 pub fn persist_rows(
@@ -165,8 +252,29 @@ pub fn persist_rows(
     project_id: i64,
     slot: ListSlot,
     drive_file: &DriveFileMetadata,
-    rows: &[NormalizedRow],
+    rows: &[ParsedRow],
 ) -> AppResult<ImportSummary> {
+    persist_rows_with_progress(
+        connection,
+        project_id,
+        slot,
+        drive_file,
+        rows,
+        Option::<fn(usize, usize)>::None,
+    )
+}
+
+pub fn persist_rows_with_progress<F>(
+    connection: &mut Connection,
+    project_id: i64,
+    slot: ListSlot,
+    drive_file: &DriveFileMetadata,
+    rows: &[ParsedRow],
+    mut progress: Option<F>,
+) -> AppResult<ImportSummary>
+where
+    F: FnMut(usize, usize),
+{
     let tx = connection.transaction()?;
     let list_name = slot.display_name();
     let list_id = persist_drive_selection(&tx, project_id, slot, Some(drive_file))?;
@@ -180,12 +288,15 @@ pub fn persist_rows(
         let mut stmt = tx.prepare(
             "INSERT INTO raw_items (list_id, source_row_hash, raw_json) VALUES (?1, ?2, ?3)",
         )?;
-        for row in rows {
+        for (index, row) in rows.iter().enumerate() {
             stmt.execute(params![
                 list_id,
-                row.source_hash(),
+                row.source_row_hash,
                 serde_json::to_string(row)?
             ])?;
+            if let Some(cb) = progress.as_mut() {
+                cb(index + 1, rows.len());
+            }
         }
     }
     tx.commit()?;
@@ -200,59 +311,46 @@ pub fn persist_rows(
 pub fn enqueue_place_hashes(
     telemetry: &TelemetryClient,
     slot: ListSlot,
-    rows: &[NormalizedRow],
+    rows: &[ParsedRow],
 ) -> AppResult<()> {
     for row in rows {
         telemetry.record_lossy(
             "raw_row_hashed",
             serde_json::json!({
                 "slot": slot.as_tag(),
-                "place_hash": row.place_hash(),
+                "place_hash": row.normalized.place_hash(),
+                "source_row_hash": row.source_row_hash,
             }),
         );
     }
     Ok(())
 }
 
-fn parse_placemark(node: Node<'_, '_>) -> AppResult<Option<NormalizedRow>> {
-    let name = node
-        .children()
-        .find(|child| child.tag_name().name() == "name")
+fn extract_raw_placemark(node: Node<'_, '_>) -> RawPlacemark {
+    RawPlacemark {
+        name: extract_tag_text(node, "name"),
+        description: extract_tag_text(node, "description"),
+        coordinates: extract_coordinates(node),
+        place_id: extract_place_id(node),
+        altitude: None,
+        layer_path: resolve_layer_path(node),
+    }
+}
+
+fn extract_tag_text(node: Node<'_, '_>, tag: &str) -> Option<String> {
+    node.children()
+        .find(|child| child.tag_name().name() == tag)
+        .and_then(|child| child.text())
+        .map(|value| collapse_whitespace(value))
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_coordinates(node: Node<'_, '_>) -> Option<String> {
+    node.descendants()
+        .find(|child| child.tag_name().name() == "coordinates")
         .and_then(|child| child.text())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Untitled placemark".to_string());
-
-    let description = node
-        .children()
-        .find(|child| child.tag_name().name() == "description")
-        .and_then(|child| child.text())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    let coordinates = node
-        .descendants()
-        .find(|child| child.tag_name().name() == "coordinates")
-        .and_then(|child| child.text())
-        .map(|value| value.trim().to_string());
-
-    let coords = match coordinates {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-
-    let (longitude, latitude, altitude) = parse_coordinates(&coords)
-        .ok_or_else(|| AppError::Parse("Placemark missing valid coordinates".into()))?;
-
-    Ok(Some(NormalizedRow {
-        title: name,
-        description,
-        longitude,
-        latitude,
-        altitude,
-        place_id: extract_place_id(node),
-        raw_coordinates: coords,
-    }))
 }
 
 fn parse_coordinates(value: &str) -> Option<(f64, f64, Option<f64>)> {
@@ -262,6 +360,54 @@ fn parse_coordinates(value: &str) -> Option<(f64, f64, Option<f64>)> {
     let latitude = parts.next()?.trim().parse().ok()?;
     let altitude = parts.next().and_then(|v| v.trim().parse().ok());
     Some((longitude, latitude, altitude))
+}
+
+fn resolve_layer_path(node: Node<'_, '_>) -> Option<String> {
+    let mut path = Vec::new();
+    for ancestor in node.ancestors() {
+        if matches!(ancestor.tag_name().name(), "Folder" | "Document") {
+            if let Some(name) = extract_tag_text(ancestor, "name") {
+                path.push(name);
+            }
+        }
+    }
+    if path.is_empty() {
+        None
+    } else {
+        path.reverse();
+        Some(path.join(" / "))
+    }
+}
+
+fn normalize_label(value: Option<&str>) -> Option<String> {
+    value.and_then(|v| {
+        let cleaned = collapse_whitespace(v);
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    })
+}
+
+fn normalize_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(|v| collapse_whitespace(v))
+        .filter(|v| !v.is_empty())
+}
+
+fn normalize_coordinate(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
 
 fn extract_place_id(node: Node<'_, '_>) -> Option<String> {
@@ -329,9 +475,10 @@ mod tests {
 
     #[test]
     fn parses_kml_rows() {
-        let rows = parse_kml(SAMPLE_KML.as_bytes()).unwrap();
-        assert_eq!(rows.len(), 2);
-        let first = &rows[0];
+        let parsed = parse_kml(SAMPLE_KML.as_bytes()).unwrap();
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.rejected.len(), 0);
+        let first = &parsed.rows[0].normalized;
         assert_eq!(first.title, "Example Place");
         assert!(first.description.as_ref().unwrap().contains("nice"));
         assert!(first.place_id.is_some());
@@ -347,7 +494,7 @@ mod tests {
         let mut conn = bootstrap.context.connection;
         let telemetry = TelemetryClient::new(dir.path(), &crate::config::AppConfig::from_env())
             .expect("telemetry");
-        let rows = parse_kml(SAMPLE_KML.as_bytes()).unwrap();
+        let parsed = parse_kml(SAMPLE_KML.as_bytes()).unwrap();
         let project_id: i64 = conn
             .query_row(
                 "SELECT id FROM comparison_projects WHERE is_active = 1 LIMIT 1",
@@ -361,10 +508,18 @@ mod tests {
             mime_type: "application/vnd.google-earth.kml+xml".into(),
             modified_time: None,
             size: None,
+            md5_checksum: None,
         };
-        let summary = persist_rows(&mut conn, project_id, ListSlot::A, &drive_file, &rows).unwrap();
+        let summary = persist_rows(
+            &mut conn,
+            project_id,
+            ListSlot::A,
+            &drive_file,
+            &parsed.rows,
+        )
+        .unwrap();
         assert_eq!(summary.row_count, 2);
-        enqueue_place_hashes(&telemetry, ListSlot::A, &rows).unwrap();
+        enqueue_place_hashes(&telemetry, ListSlot::A, &parsed.rows).unwrap();
 
         let count: i64 = conn
             .query_row(

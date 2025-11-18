@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import http from "node:http";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +11,12 @@ const fixtures = {
   "list-a": readFileSync(resolve(qaDir, "list-a.kml"), "utf8"),
   "list-b": readFileSync(resolve(qaDir, "list-b.kml"), "utf8"),
 };
+const fixtureHashes = Object.fromEntries(
+  Object.entries(fixtures).map(([key, body]) => [
+    key,
+    createHash("md5").update(body, "utf8").digest("hex"),
+  ]),
+);
 
 const port = Number(process.env.MOCK_DRIVE_PORT ?? 8788);
 const issuedDeviceCode = "mock-device-code";
@@ -56,6 +63,7 @@ const server = http.createServer((req, res) => {
           mimeType: "application/vnd.google-earth.kml+xml",
           modifiedTime: "2024-10-01T10:00:00Z",
           size: String(Buffer.byteLength(fixtures["list-a"], "utf8")),
+          md5Checksum: fixtureHashes["list-a"],
         },
         {
           id: "list-b",
@@ -63,6 +71,7 @@ const server = http.createServer((req, res) => {
           mimeType: "application/vnd.google-earth.kml+xml",
           modifiedTime: "2024-10-02T08:00:00Z",
           size: String(Buffer.byteLength(fixtures["list-b"], "utf8")),
+          md5Checksum: fixtureHashes["list-b"],
         },
       ],
     });

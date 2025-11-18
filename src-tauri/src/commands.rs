@@ -170,6 +170,7 @@ pub async fn drive_import_kml(
     mime_type: Option<String>,
     modified_time: Option<String>,
     size: Option<u64>,
+    md5_checksum: Option<String>,
 ) -> Result<ImportSummary, String> {
     let parsed_slot = ListSlot::parse(&slot).map_err(|err| err.to_string())?;
     state
@@ -181,6 +182,7 @@ pub async fn drive_import_kml(
             mime_type,
             modified_time,
             size,
+            md5_checksum,
         )
         .await
         .map_err(|err| err.to_string())
