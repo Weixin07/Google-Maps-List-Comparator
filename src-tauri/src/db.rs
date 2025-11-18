@@ -228,6 +228,10 @@ fn run_migrations(connection: &Connection) -> AppResult<()> {
         "project_id INTEGER REFERENCES comparison_projects(id)",
     )?;
     ensure_column(connection, "lists", "slot TEXT NOT NULL DEFAULT 'A'")?;
+    ensure_column(connection, "lists", "drive_file_name TEXT")?;
+    ensure_column(connection, "lists", "drive_file_mime TEXT")?;
+    ensure_column(connection, "lists", "drive_file_size INTEGER")?;
+    ensure_column(connection, "lists", "drive_modified_time TEXT")?;
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_places_lat_lng ON places(lat, lng)",
         [],

@@ -1,11 +1,12 @@
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use roxmltree::{Document, Node};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::errors::{AppError, AppResult};
+use crate::google::DriveFileMetadata;
 use crate::telemetry::TelemetryClient;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -78,6 +79,68 @@ pub struct ImportSummary {
     pub row_count: usize,
 }
 
+fn ensure_list_record(connection: &Connection, project_id: i64, slot: ListSlot) -> AppResult<i64> {
+    connection.execute(
+        "INSERT INTO lists (project_id, slot, name, source)
+        SELECT ?1, ?2, ?3, 'drive_kml'
+        WHERE NOT EXISTS (SELECT 1 FROM lists WHERE project_id = ?1 AND slot = ?2)",
+        (project_id, slot.as_tag(), slot.display_name()),
+    )?;
+
+    connection
+        .query_row(
+            "SELECT id FROM lists WHERE project_id = ?1 AND slot = ?2 LIMIT 1",
+            (project_id, slot.as_tag()),
+            |row| row.get(0),
+        )
+        .map_err(AppError::from)
+}
+
+pub fn persist_drive_selection(
+    connection: &Connection,
+    project_id: i64,
+    slot: ListSlot,
+    drive_file: Option<&DriveFileMetadata>,
+) -> AppResult<i64> {
+    let list_id = ensure_list_record(connection, project_id, slot)?;
+    match drive_file {
+        Some(file) => {
+            connection.execute(
+                "UPDATE lists
+                SET drive_file_id = ?1,
+                    drive_file_name = ?2,
+                    drive_file_mime = ?3,
+                    drive_file_size = ?4,
+                    drive_modified_time = ?5,
+                    name = ?6
+                WHERE id = ?7",
+                (
+                    file.id.as_str(),
+                    file.name.as_str(),
+                    file.mime_type.as_str(),
+                    file.size.map(|value| value as i64),
+                    file.modified_time.clone(),
+                    slot.display_name(),
+                    list_id,
+                ),
+            )?;
+        }
+        None => {
+            connection.execute(
+                "UPDATE lists
+                SET drive_file_id = NULL,
+                    drive_file_name = NULL,
+                    drive_file_mime = NULL,
+                    drive_file_size = NULL,
+                    drive_modified_time = NULL
+                WHERE id = ?1",
+                [list_id],
+            )?;
+        }
+    }
+    Ok(list_id)
+}
+
 pub fn parse_kml(bytes: &[u8]) -> AppResult<Vec<NormalizedRow>> {
     let xml = std::str::from_utf8(bytes)
         .map_err(|err| AppError::Parse(format!("invalid UTF-8 in KML: {err}")))?;
@@ -101,40 +164,16 @@ pub fn persist_rows(
     connection: &mut Connection,
     project_id: i64,
     slot: ListSlot,
-    drive_file_id: &str,
+    drive_file: &DriveFileMetadata,
     rows: &[NormalizedRow],
 ) -> AppResult<ImportSummary> {
     let tx = connection.transaction()?;
     let list_name = slot.display_name();
-    let existing: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM lists WHERE project_id = ?1 AND slot = ?2 LIMIT 1",
-            (project_id, slot.as_tag()),
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    let list_id = match existing {
-        Some(id) => {
-            tx.execute(
-                "UPDATE lists
-                SET drive_file_id = ?1,
-                    imported_at = DATETIME('now'),
-                    name = ?3
-                WHERE id = ?2",
-                (drive_file_id, id, list_name),
-            )?;
-            id
-        }
-        None => {
-            tx.execute(
-                "INSERT INTO lists (project_id, slot, name, source, drive_file_id)
-                VALUES (?1, ?2, ?3, 'drive_kml', ?4)",
-                (project_id, slot.as_tag(), list_name, drive_file_id),
-            )?;
-            tx.last_insert_rowid()
-        }
-    };
+    let list_id = persist_drive_selection(&tx, project_id, slot, Some(drive_file))?;
+    tx.execute(
+        "UPDATE lists SET imported_at = DATETIME('now') WHERE id = ?1",
+        [list_id],
+    )?;
 
     tx.execute("DELETE FROM raw_items WHERE list_id = ?1", [list_id])?;
     {
@@ -260,6 +299,7 @@ mod tests {
 
     use super::*;
     use crate::db::bootstrap;
+    use crate::google::DriveFileMetadata;
     use crate::secrets::SecretVault;
 
     const SAMPLE_KML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -315,8 +355,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let summary =
-            persist_rows(&mut conn, project_id, ListSlot::A, "drive-file", &rows).unwrap();
+        let drive_file = DriveFileMetadata {
+            id: "drive-file".into(),
+            name: "List A".into(),
+            mime_type: "application/vnd.google-earth.kml+xml".into(),
+            modified_time: None,
+            size: None,
+        };
+        let summary = persist_rows(&mut conn, project_id, ListSlot::A, &drive_file, &rows).unwrap();
         assert_eq!(summary.row_count, 2);
         enqueue_place_hashes(&telemetry, ListSlot::A, &rows).unwrap();
 

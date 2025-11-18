@@ -5,8 +5,8 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use tauri_app_lib::{
-    bootstrap, enqueue_place_hashes, parse_kml, persist_rows, AppConfig, GoogleServices, ListSlot,
-    SecretVault, TelemetryClient,
+    bootstrap, enqueue_place_hashes, parse_kml, persist_rows, AppConfig, DriveFileMetadata,
+    GoogleServices, ListSlot, SecretVault, TelemetryClient,
 };
 
 const SAMPLE_KML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -128,7 +128,7 @@ async fn device_flow_and_import_roundtrip() {
 
     let mut checkpoints = Vec::new();
     let bytes = google
-        .download_file("drive-file", |received, total| {
+        .download_file("drive-file", None, |received, total| {
             checkpoints.push((received, total));
         })
         .await
@@ -150,14 +150,15 @@ async fn device_flow_and_import_roundtrip() {
             |row| row.get(0),
         )
         .expect("project id");
-    let summary = persist_rows(
-        &mut connection,
-        project_id,
-        ListSlot::A,
-        "drive-file",
-        &rows,
-    )
-    .expect("persist rows");
+    let drive_file = DriveFileMetadata {
+        id: "drive-file".into(),
+        name: "List A".into(),
+        mime_type: "application/vnd.google-earth.kml+xml".into(),
+        modified_time: Some("2024-01-01T00:00:00Z".into()),
+        size: Some(128),
+    };
+    let summary = persist_rows(&mut connection, project_id, ListSlot::A, &drive_file, &rows)
+        .expect("persist rows");
     assert_eq!(summary.row_count, 1);
 
     let telemetry = TelemetryClient::new(dir.path(), &config).expect("telemetry");

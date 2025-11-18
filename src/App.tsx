@@ -14,6 +14,7 @@ import type {
   MapStyleDescriptor,
   PlaceComparisonRow,
 } from "./types/comparison";
+import type { DriveFileMetadata } from "./types/drive";
 import { ComparisonTable, type TableFilters } from "./components/comparison/ComparisonTable";
 import { ComparisonMap } from "./components/comparison/ComparisonMap";
 import "./App.css";
@@ -33,14 +34,6 @@ type GoogleIdentity = {
   name?: string | null;
   picture?: string | null;
   expires_at: string;
-};
-
-type DriveFileMetadata = {
-  id: string;
-  name: string;
-  mime_type: string;
-  modified_time?: string | null;
-  size?: number | null;
 };
 
 type ImportProgressPayload = {
@@ -261,7 +254,17 @@ function App() {
   const [driveFiles, setDriveFiles] = useState<DriveFileMetadata[]>([]);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [fileQuery, setFileQuery] = useState("");
+  const [fileTypeFilter, setFileTypeFilter] = useState<"all" | "kml" | "map">(
+    "all",
+  );
   const [selectedFiles, setSelectedFiles] = useState<Record<ListSlot, DriveFileMetadata | null>>({
+    A: null,
+    B: null,
+  });
+  const [selectionErrors, setSelectionErrors] = useState<
+    Record<ListSlot, string | null>
+  >({
     A: null,
     B: null,
   });
@@ -507,20 +510,20 @@ function App() {
         const detailList =
           event.payload.stage === "error"
             ? event.payload.details?.filter((detail) => detail.trim().length > 0) ??
-              (event.payload.error ? [event.payload.error] : [])
+            (event.payload.error ? [event.payload.error] : [])
             : undefined;
         const nextHistory = isTerminal
           ? [
-              {
-                id: attemptId,
-                fileName: event.payload.file_name ?? previous.fileName,
-                finishedAt: now,
-                status: event.payload.stage === "complete" ? "success" : "error",
-                summary: event.payload.message,
-                details: detailList,
-              },
-              ...previous.history,
-            ].slice(0, 5)
+            {
+              id: attemptId,
+              fileName: event.payload.file_name ?? previous.fileName,
+              finishedAt: now,
+              status: event.payload.stage === "complete" ? "success" : "error",
+              summary: event.payload.message,
+              details: detailList,
+            },
+            ...previous.history,
+          ].slice(0, 5)
           : previous.history;
         return {
           ...prev,
@@ -570,29 +573,29 @@ function App() {
     };
   }, []);
 
-useEffect(() => {
-  if (!foundationHealth) {
-    setRuntimeSettings(null);
-    return;
-  }
-  setRuntimeSettings(foundationHealth.settings);
-  setPendingRateLimit(foundationHealth.settings.places_rate_limit_qps);
-  telemetry.setEnabled(foundationHealth.settings.telemetry_enabled);
-  telemetry.setInstallSalt(foundationHealth.settings.telemetry_salt);
-  telemetry.configureUpload({
-    endpoint: foundationHealth.config.telemetry_endpoint ?? undefined,
-    distinctId: foundationHealth.settings.telemetry_salt,
-  });
-  telemetry.track(
-    "foundation_health_loaded",
-    {
-      queueDepth: foundationHealth.telemetry_queue_depth,
-      recovered: foundationHealth.db_bootstrap_recovered,
-      telemetryEnabled: foundationHealth.settings.telemetry_enabled,
-    },
-    { flush: true },
-  );
-}, [foundationHealth]);
+  useEffect(() => {
+    if (!foundationHealth) {
+      setRuntimeSettings(null);
+      return;
+    }
+    setRuntimeSettings(foundationHealth.settings);
+    setPendingRateLimit(foundationHealth.settings.places_rate_limit_qps);
+    telemetry.setEnabled(foundationHealth.settings.telemetry_enabled);
+    telemetry.setInstallSalt(foundationHealth.settings.telemetry_salt);
+    telemetry.configureUpload({
+      endpoint: foundationHealth.config.telemetry_endpoint ?? undefined,
+      distinctId: foundationHealth.settings.telemetry_salt,
+    });
+    telemetry.track(
+      "foundation_health_loaded",
+      {
+        queueDepth: foundationHealth.telemetry_queue_depth,
+        recovered: foundationHealth.db_bootstrap_recovered,
+        telemetryEnabled: foundationHealth.settings.telemetry_enabled,
+      },
+      { flush: true },
+    );
+  }, [foundationHealth]);
 
   useEffect(() => {
     if (activeProjectId) {
@@ -612,11 +615,42 @@ useEffect(() => {
     setFocusPoint(null);
     setExportStatus(null);
     setSelectedFiles({ A: null, B: null });
+    setSelectionErrors({ A: null, B: null });
     setImports({
       A: createImportState(),
       B: createImportState(),
     });
   }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!activeProjectId) {
+      setSelectedFiles({ A: null, B: null });
+      return;
+    }
+    const project = projects.find((record) => record.id === activeProjectId);
+    const resolveSlotSelection = (slot: ListSlot): DriveFileMetadata | null => {
+      const stored =
+        slot === "A"
+          ? project?.list_a_drive_file ?? null
+          : project?.list_b_drive_file ?? null;
+      if (!stored) {
+        return null;
+      }
+      const latest = driveFiles.find((file) => file.id === stored.id);
+      return latest ?? stored;
+    };
+    setSelectedFiles({
+      A: resolveSlotSelection("A"),
+      B: resolveSlotSelection("B"),
+    });
+  }, [activeProjectId, projects, driveFiles]);
+
+  useEffect(() => {
+    setSelectionErrors({
+      A: validateDriveSelection("A", selectedFiles.A),
+      B: validateDriveSelection("B", selectedFiles.B),
+    });
+  }, [selectedFiles]);
 
   const handleFiltersChange = useCallback(
     (segment: ComparisonSegmentKey, nextFilters: TableFilters) => {
@@ -834,7 +868,7 @@ useEffect(() => {
         const matchesCategory =
           !categoryFilter ||
           (categoryMap.get(row.place_id) ?? resolveCategory(row.types)) ===
-            categoryFilter;
+          categoryFilter;
         return matchesSearch && matchesType && matchesCategory;
       });
       return acc;
@@ -976,6 +1010,9 @@ useEffect(() => {
       setIsRequestingCode(false);
       setIsCompletingSignIn(false);
       setPickerError(null);
+      setFileQuery("");
+      setFileTypeFilter("all");
+      setSelectionErrors({ A: null, B: null });
       setSelectedFiles({ A: null, B: null });
       setImports({
         A: createImportState(),
@@ -996,7 +1033,12 @@ useEffect(() => {
       });
       setDriveFiles(files);
     } catch (error) {
-      setPickerError(normalizeError(error));
+      const message = normalizeError(error);
+      setPickerError(message);
+      if (message.toLowerCase().includes("auth") || message.toLowerCase().includes("sign")) {
+        setSignInError(message);
+        setIdentity(null);
+      }
     } finally {
       setIsLoadingFiles(false);
     }
@@ -1008,6 +1050,31 @@ useEffect(() => {
     }
     void loadDriveFiles();
   }, [identity, loadDriveFiles]);
+
+  const filteredDriveFiles = useMemo(() => {
+    const search = fileQuery.trim().toLowerCase();
+    return driveFiles.filter((file) => {
+      const matchesQuery =
+        !search ||
+        file.name.toLowerCase().includes(search) ||
+        (file.modified_time ?? "").toLowerCase().includes(search);
+      const kind = driveFileKind(file);
+      const matchesType = fileTypeFilter === "all" || kind === fileTypeFilter;
+      return matchesQuery && matchesType;
+    });
+  }, [driveFiles, fileQuery, fileTypeFilter]);
+
+  const driveOptionsForSlot = useCallback(
+    (slot: ListSlot) => {
+      const current = selectedFiles[slot];
+      if (!current) {
+        return filteredDriveFiles;
+      }
+      const alreadyIncluded = filteredDriveFiles.some((file) => file.id === current.id);
+      return alreadyIncluded ? filteredDriveFiles : [current, ...filteredDriveFiles];
+    },
+    [filteredDriveFiles, selectedFiles],
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -1084,11 +1151,11 @@ useEffect(() => {
       prev.map((job) =>
         job.id === nextJob.id
           ? {
-              ...job,
-              status: "running",
-              startedAt: Date.now(),
-              message: "Preparing refresh…",
-            }
+            ...job,
+            status: "running",
+            startedAt: Date.now(),
+            message: "Preparing refresh…",
+          }
           : job,
       ),
     );
@@ -1140,11 +1207,11 @@ useEffect(() => {
           prev.map((job) =>
             job.id === nextJob.id
               ? {
-                  ...job,
-                  status: "error",
-                  finishedAt: Date.now(),
-                  message,
-                }
+                ...job,
+                status: "error",
+                finishedAt: Date.now(),
+                message,
+              }
               : job,
           ),
         );
@@ -1156,18 +1223,39 @@ useEffect(() => {
 
   const handleFileSelection = useCallback(
     (slot: ListSlot, fileId: string) => {
-      const file = driveFiles.find((entry) => entry.id === fileId) ?? null;
+      const fallback = selectedFiles[slot];
+      const file =
+        fileId === ""
+          ? null
+          : driveFiles.find((entry) => entry.id === fileId) ?? fallback ?? null;
       setSelectedFiles((prev) => ({
         ...prev,
         [slot]: file,
       }));
+      if (activeProjectId) {
+        void invoke("drive_save_selection", {
+          projectId: activeProjectId,
+          slot,
+          file,
+        }).catch((error) => setPickerError(normalizeError(error)));
+        setProjects((prev) =>
+          prev.map((project) =>
+            project.id === activeProjectId
+              ? {
+                ...project,
+                [slot === "A" ? "list_a_drive_file" : "list_b_drive_file"]: file,
+              }
+              : project,
+          ),
+        );
+      }
       if (file) {
         void hashIdentifier(file.id).then((hash) => {
           telemetry.track("drive_file_selected", { slot, fileHash: hash });
         });
       }
     },
-    [driveFiles],
+    [activeProjectId, driveFiles, selectedFiles],
   );
 
   const handleImport = useCallback(
@@ -1187,6 +1275,23 @@ useEffect(() => {
             progress: 0,
             error: undefined,
             errorDetails: undefined,
+            attemptId: undefined,
+            startedAt: undefined,
+          },
+        }));
+        return;
+      }
+      if (selectionErrors[slot]) {
+        const validationMessage = selectionErrors[slot];
+        setImports((prev) => ({
+          ...prev,
+          [slot]: {
+            ...prev[slot],
+            stage: "idle",
+            message: validationMessage ?? "Select a Drive KML before importing",
+            progress: 0,
+            error: validationMessage ?? undefined,
+            errorDetails: validationMessage ? [validationMessage] : undefined,
             attemptId: undefined,
             startedAt: undefined,
           },
@@ -1223,6 +1328,9 @@ useEffect(() => {
           slot,
           fileId: file.id,
           fileName: file.name,
+          mimeType: file.mime_type,
+          modifiedTime: file.modified_time,
+          size: file.size,
         });
         const hash = await fileHashPromise;
         if (hash) {
@@ -1234,6 +1342,10 @@ useEffect(() => {
         }
       } catch (error) {
         const message = normalizeError(error);
+        if (message.toLowerCase().includes("auth") || message.toLowerCase().includes("sign")) {
+          setSignInError(message);
+          setIdentity(null);
+        }
         setImports((prev) => {
           const previous = prev[slot];
           if (previous.stage === "error") {
@@ -1266,7 +1378,7 @@ useEffect(() => {
         });
       }
     },
-    [activeProjectId, selectedFiles],
+    [activeProjectId, selectedFiles, selectionErrors],
   );
 
   const slotBusy = (slot: ListSlot) => {
@@ -1873,6 +1985,35 @@ useEffect(() => {
             {pickerError && <p className="error-text">{pickerError}</p>}
             {identity && (
               <>
+                <div className="drive-filters">
+                  <div className="drive-filters__inputs">
+                    <input
+                      type="search"
+                      placeholder="Search Drive files"
+                      value={fileQuery}
+                      onChange={(event) => setFileQuery(event.target.value)}
+                    />
+                    <select
+                      value={fileTypeFilter}
+                      onChange={(event) =>
+                        setFileTypeFilter(
+                          event.target.value === "map"
+                            ? "map"
+                            : event.target.value === "kml"
+                              ? "kml"
+                              : "all",
+                        )
+                      }
+                    >
+                      <option value="all">All types</option>
+                      <option value="kml">KML</option>
+                      <option value="map">My Maps</option>
+                    </select>
+                  </div>
+                  <p className="muted">
+                    Showing {filteredDriveFiles.length} of {driveFiles.length} Drive files
+                  </p>
+                </div>
                 <div className="list-toolbar">
                   <button
                     type="button"
@@ -1891,9 +2032,8 @@ useEffect(() => {
                   <p className="muted">
                     {failedSlots.length === 0
                       ? "No failed imports at the moment."
-                      : `${failedSlots.length} list${
-                          failedSlots.length === 1 ? "" : "s"
-                        } ready for retry.`}
+                      : `${failedSlots.length} list${failedSlots.length === 1 ? "" : "s"
+                      } ready for retry.`}
                   </p>
                 </div>
                 <div className="list-grid">
@@ -1902,33 +2042,45 @@ useEffect(() => {
                       <div className="list-card__header">
                         <h3>List {slot}</h3>
                         <span className="list-card__count">
-                          {driveFiles.length} file{driveFiles.length === 1 ? "" : "s"}
+                          {filteredDriveFiles.length}/{driveFiles.length} file
+                          {driveFiles.length === 1 ? "" : "s"}
                         </span>
                       </div>
                       <label className="field-label" htmlFor={`slot-${slot}`}>
-                        Drive KML
+                        Drive KML / My Maps
                       </label>
                       <select
                         id={`slot-${slot}`}
                         value={selectedFiles[slot]?.id ?? ""}
                         onChange={(event) => handleFileSelection(slot, event.target.value)}
-                        disabled={driveFiles.length === 0 || isLoadingFiles}
+                        disabled={driveOptionsForSlot(slot).length === 0 || isLoadingFiles}
                       >
                         <option value="">Select a file</option>
-                        {driveFiles.map((file) => (
+                        {driveOptionsForSlot(slot).map((file) => (
                           <option key={`${slot}-${file.id}`} value={file.id}>
-                            {file.name}
-                            {file.modified_time
-                              ? ` (${new Date(file.modified_time).toLocaleDateString()})`
-                              : ""}
+                            {formatDriveFileLabel(file)}
                           </option>
                         ))}
                       </select>
+                      {selectedFiles[slot] && (
+                        <div className="file-meta">
+                          <p className="file-meta__name">{selectedFiles[slot]?.name}</p>
+                          <p className="muted">{formatDriveFileMeta(selectedFiles[slot]!)}</p>
+                        </div>
+                      )}
+                      {selectionErrors[slot] && (
+                        <p className="error-text">{selectionErrors[slot]}</p>
+                      )}
                       <button
                         type="button"
                         className="primary-button"
                         onClick={() => void handleImport(slot)}
-                        disabled={!selectedFiles[slot] || slotBusy(slot) || !activeProjectId}
+                        disabled={
+                          !selectedFiles[slot] ||
+                          slotBusy(slot) ||
+                          !activeProjectId ||
+                          !!selectionErrors[slot]
+                        }
                       >
                         {slotBusy(slot) ? "Importing…" : `Import to List ${slot}`}
                       </button>
@@ -2026,6 +2178,76 @@ useEffect(() => {
 }
 
 export default App;
+
+function driveFileKind(file: DriveFileMetadata): "kml" | "map" {
+  return file.mime_type.includes("vnd.google-apps.map") ? "map" : "kml";
+}
+
+function formatBytes(size?: number | null): string | null {
+  if (!size || size <= 0) {
+    return null;
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  const exponent = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
+  const value = size / 1024 ** exponent;
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[exponent]}`;
+}
+
+function formatDriveDate(value?: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function formatDriveFileLabel(file: DriveFileMetadata): string {
+  const parts = [file.name];
+  parts.push(driveFileKind(file) === "map" ? "My Maps" : "KML");
+  const size = formatBytes(file.size ?? null);
+  const date = formatDriveDate(file.modified_time ?? null);
+  if (size) {
+    parts.push(size);
+  }
+  if (date) {
+    parts.push(date);
+  }
+  return parts.join(" · ");
+}
+
+function formatDriveFileMeta(file: DriveFileMetadata): string {
+  const parts = [driveFileKind(file) === "map" ? "My Maps layer" : "KML file"];
+  const size = formatBytes(file.size ?? null);
+  const date = formatDriveDate(file.modified_time ?? null);
+  if (size) {
+    parts.push(size);
+  }
+  if (date) {
+    parts.push(`updated ${date}`);
+  }
+  return parts.join(" · ");
+}
+
+function validateDriveSelection(
+  slot: ListSlot,
+  file: DriveFileMetadata | null,
+): string | null {
+  if (!file) {
+    return null;
+  }
+  const normalized = file.name.trim().toLowerCase();
+  const expected = `list ${slot.toLowerCase()}`;
+  const nameMatches = normalized.includes(expected);
+  const hasValidExtension =
+    normalized.endsWith(".kml") || normalized.endsWith(".kmz") || driveFileKind(file) === "map";
+  if (!nameMatches || !hasValidExtension) {
+    return `Name must look like "List ${slot}.kml"`;
+  }
+  return null;
+}
 
 function normalizeError(error: unknown): string {
   if (error instanceof Error) {

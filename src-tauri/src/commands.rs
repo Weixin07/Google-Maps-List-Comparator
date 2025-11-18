@@ -130,9 +130,7 @@ pub async fn google_current_identity(
 }
 
 #[tauri::command]
-pub async fn google_keepalive(
-    state: tauri::State<'_, AppState>,
-) -> Result<GoogleIdentity, String> {
+pub async fn google_keepalive(state: tauri::State<'_, AppState>) -> Result<GoogleIdentity, String> {
     state
         .keepalive_google()
         .await
@@ -169,11 +167,35 @@ pub async fn drive_import_kml(
     slot: String,
     file_id: String,
     file_name: String,
+    mime_type: Option<String>,
+    modified_time: Option<String>,
+    size: Option<u64>,
 ) -> Result<ImportSummary, String> {
     let parsed_slot = ListSlot::parse(&slot).map_err(|err| err.to_string())?;
     state
-        .import_drive_file(project_id, parsed_slot, file_id, file_name)
+        .import_drive_file(
+            project_id,
+            parsed_slot,
+            file_id,
+            file_name,
+            mime_type,
+            modified_time,
+            size,
+        )
         .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn drive_save_selection(
+    state: tauri::State<'_, AppState>,
+    project_id: Option<i64>,
+    slot: String,
+    file: Option<DriveFileMetadata>,
+) -> Result<(), String> {
+    let parsed_slot = ListSlot::parse(&slot).map_err(|err| err.to_string())?;
+    state
+        .save_drive_selection(project_id, parsed_slot, file)
         .map_err(|err| err.to_string())
 }
 
@@ -195,12 +217,8 @@ pub async fn refresh_place_details(
 }
 
 #[tauri::command]
-pub async fn cancel_refresh_queue(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    state
-        .cancel_refresh_queue()
-        .map_err(|err| err.to_string())
+pub async fn cancel_refresh_queue(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.cancel_refresh_queue().map_err(|err| err.to_string())
 }
 
 #[tauri::command]

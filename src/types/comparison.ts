@@ -1,3 +1,5 @@
+import type { DriveFileMetadata } from "./drive";
+
 export type ListSlot = "A" | "B";
 
 export type ComparisonStats = {
@@ -44,6 +46,8 @@ export type ComparisonProjectRecord = {
   is_active: boolean;
   list_a_imported_at?: string | null;
   list_b_imported_at?: string | null;
+  list_a_drive_file?: DriveFileMetadata | null;
+  list_b_drive_file?: DriveFileMetadata | null;
 };
 
 export type MapStyleDescriptor = {

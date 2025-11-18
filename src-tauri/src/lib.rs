@@ -20,9 +20,9 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use csv::WriterBuilder;
-use reqwest::StatusCode;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
+use reqwest::StatusCode;
 use rusqlite::Connection as SqlConnection;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -389,11 +389,7 @@ impl AppState {
         &self,
         timeout_secs: Option<u64>,
     ) -> AppResult<GoogleIdentity> {
-        match self
-            .google()?
-            .complete_loopback_flow(timeout_secs)
-            .await
-        {
+        match self.google()?.complete_loopback_flow(timeout_secs).await {
             Ok(identity) => {
                 self.record_signin_success(&identity);
                 Ok(identity)
@@ -418,7 +414,9 @@ impl AppState {
     }
 
     pub fn refresh_status_google(&self) -> Option<String> {
-        self.google().ok().and_then(|svc| svc.last_refresh_failure())
+        self.google()
+            .ok()
+            .and_then(|svc| svc.last_refresh_failure())
     }
 
     pub async fn list_drive_files(
@@ -437,23 +435,48 @@ impl AppState {
         Ok(files)
     }
 
+    pub fn save_drive_selection(
+        &self,
+        project_id: Option<i64>,
+        slot: ListSlot,
+        drive_file: Option<DriveFileMetadata>,
+    ) -> AppResult<()> {
+        let resolved_project = self.resolve_project_id(project_id)?;
+        let mut conn = self.db.lock();
+        ingestion::persist_drive_selection(&mut conn, resolved_project, slot, drive_file.as_ref())?;
+        Ok(())
+    }
+
     pub async fn import_drive_file(
         &self,
         project_id: Option<i64>,
         slot: ListSlot,
         file_id: String,
         file_name: String,
+        mime_type: Option<String>,
+        modified_time: Option<String>,
+        size: Option<u64>,
     ) -> AppResult<ImportSummary> {
         let resolved_project = self.resolve_project_id(project_id)?;
         let file_hash = fingerprint(&file_id);
-        match self
-            .import_drive_file_inner(
+        let drive_file = DriveFileMetadata {
+            id: file_id.clone(),
+            name: file_name.clone(),
+            mime_type: mime_type.unwrap_or_else(|| "application/vnd.google-earth.kml+xml".into()),
+            modified_time,
+            size,
+        };
+        {
+            let mut conn = self.db.lock();
+            ingestion::persist_drive_selection(
+                &mut conn,
                 resolved_project,
                 slot,
-                file_id,
-                file_name.clone(),
-                file_hash.clone(),
-            )
+                Some(&drive_file),
+            )?;
+        }
+        match self
+            .import_drive_file_inner(resolved_project, slot, drive_file, file_hash.clone())
             .await
         {
             Ok(summary) => Ok(summary),
@@ -638,8 +661,7 @@ impl AppState {
         &self,
         project_id: i64,
         slot: ListSlot,
-        file_id: String,
-        file_name: String,
+        drive_file: DriveFileMetadata,
         file_hash: String,
     ) -> AppResult<ImportSummary> {
         if let Err(err) = self.telemetry.record(
@@ -656,7 +678,7 @@ impl AppState {
             json!({
                 "slot": slot.as_tag(),
                 "file_hash": file_hash.clone(),
-                "file_name": file_name.clone(),
+                "file_name": drive_file.name.clone(),
             }),
         ) {
             warn!(?err, "failed to record import_started telemetry");
@@ -665,12 +687,12 @@ impl AppState {
         self.notify_progress(ImportProgressPayload::new(
             slot,
             "download",
-            format!("Downloading {}", file_name),
+            format!("Downloading {}", drive_file.name),
             0.0,
-            Some(file_name.clone()),
+            Some(drive_file.name.clone()),
         ));
 
-        let progress_label = file_name.clone();
+        let progress_label = drive_file.name.clone();
         let mut progress_cb = |received: u64, total: Option<u64>| {
             let pct = total
                 .and_then(|t| {
@@ -691,14 +713,20 @@ impl AppState {
         };
 
         let downloader = self.google()?.clone();
-        let bytes = downloader.download_file(&file_id, &mut progress_cb).await?;
+        let bytes = downloader
+            .download_file(
+                &drive_file.id,
+                Some(&drive_file.mime_type),
+                &mut progress_cb,
+            )
+            .await?;
 
         self.notify_progress(ImportProgressPayload::new(
             slot,
             "parse",
             "Parsing KML data",
             0.65,
-            Some(file_name.clone()),
+            Some(drive_file.name.clone()),
         ));
 
         let rows = parse_kml(&bytes)?;
@@ -707,12 +735,12 @@ impl AppState {
             "persist",
             format!("Persisting {} rows", rows.len()),
             0.85,
-            Some(file_name.clone()),
+            Some(drive_file.name.clone()),
         ));
 
         let summary = {
             let mut conn = self.db.lock();
-            persist_rows(&mut conn, project_id, slot, &file_id, &rows)?
+            persist_rows(&mut conn, project_id, slot, &drive_file, &rows)?
         };
 
         enqueue_place_hashes(&self.telemetry, slot, &rows)?;
@@ -722,7 +750,7 @@ impl AppState {
             "normalize",
             "Reconciling Places details",
             0.92,
-            Some(file_name.clone()),
+            Some(drive_file.name.clone()),
         ));
 
         let normalization = self
@@ -735,7 +763,7 @@ impl AppState {
             "complete",
             format!("Imported {} rows for {}", rows.len(), slot.display_name()),
             1.0,
-            Some(file_name),
+            Some(drive_file.name.clone()),
         ));
 
         if let Err(err) = self.telemetry.record(
@@ -924,11 +952,17 @@ fn describe_import_error(err: &AppError) -> (String, Vec<String>) {
         ),
         AppError::Json(reason) => (
             "Unable to process Drive response".into(),
-            vec![format!("JSON error: {}", sanitize_error_copy(&reason.to_string()))],
+            vec![format!(
+                "JSON error: {}",
+                sanitize_error_copy(&reason.to_string())
+            )],
         ),
         AppError::Io(io_err) => (
             "Failed to persist Drive data locally".into(),
-            vec![format!("I/O error: {}", sanitize_error_copy(&io_err.to_string()))],
+            vec![format!(
+                "I/O error: {}",
+                sanitize_error_copy(&io_err.to_string())
+            )],
         ),
         AppError::Database(db_err) => (
             "Database write failed during import".into(),
@@ -943,7 +977,10 @@ fn describe_import_error(err: &AppError) -> (String, Vec<String>) {
         ),
         AppError::Keychain(err) => (
             "Secure storage was not accessible".into(),
-            vec![format!("Keychain: {}", sanitize_error_copy(&err.to_string()))],
+            vec![format!(
+                "Keychain: {}",
+                sanitize_error_copy(&err.to_string())
+            )],
         ),
         _ => (
             "Unexpected import failure".into(),
@@ -1023,6 +1060,7 @@ pub fn run() {
             commands::google_sign_out,
             commands::drive_list_kml_files,
             commands::drive_import_kml,
+            commands::drive_save_selection,
             commands::refresh_place_details,
             commands::cancel_refresh_queue,
             commands::compare_lists,

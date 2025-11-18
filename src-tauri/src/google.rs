@@ -5,9 +5,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Duration, Utc};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use reqwest::{Client, Url};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use reqwest::{Client, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,8 @@ use tracing::warn;
 
 const TOKEN_ALIAS: &str = "google-oauth-token";
 const DRIVE_KML_MIME: &str = "application/vnd.google-earth.kml+xml";
+const DRIVE_MAPS_MIME: &str = "application/vnd.google-apps.map";
+const DRIVE_KML_EXPORT_MIME: &str = "application/vnd.google-earth.kml+xml";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_WAIT_SECS: u64 = 5;
 const DEFAULT_LOOPBACK_TIMEOUT_SECS: u64 = 180;
@@ -33,6 +35,7 @@ const LOOPBACK_HOST: &str = "127.0.0.1";
 
 const GOOGLE_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
     "openid",
     "email",
     "profile",
@@ -85,7 +88,7 @@ pub struct GoogleIdentity {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriveFileMetadata {
     pub id: String,
     pub name: String,
@@ -264,10 +267,10 @@ impl GoogleServices {
         let code_challenge = build_code_challenge(&code_verifier)?;
         let expires_at = Utc::now() + Duration::minutes(10);
 
-        let mut auth_url = Url::parse(&self.config.auth_endpoint).map_err(|err| {
-            AppError::Config(format!("invalid Google auth endpoint: {err}"))
-        })?;
-        auth_url.query_pairs_mut()
+        let mut auth_url = Url::parse(&self.config.auth_endpoint)
+            .map_err(|err| AppError::Config(format!("invalid Google auth endpoint: {err}")))?;
+        auth_url
+            .query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.config.client_id)
             .append_pair("redirect_uri", &redirect_url)
@@ -493,56 +496,107 @@ impl GoogleServices {
 
     pub async fn list_kml_files(&self, limit: Option<usize>) -> AppResult<Vec<DriveFileMetadata>> {
         let token = self.ensure_token().await?;
-        let mut url = self.drive_url()?;
-        url.path_segments_mut()
-            .map_err(|_| AppError::Config("invalid Drive API base".into()))?
-            .push("files");
+        let target = limit.unwrap_or(self.config.picker_page_size).max(1);
+        let page_size = self.config.picker_page_size.clamp(1, 100);
+        let mut next_page: Option<String> = None;
+        let mut results = Vec::new();
 
-        let page_size = limit.unwrap_or(self.config.picker_page_size).clamp(1, 100);
-        url.query_pairs_mut()
-            .append_pair(
-                "q",
-                &format!("mimeType='{}' and trashed = false", DRIVE_KML_MIME),
-            )
-            .append_pair("fields", "files(id,name,mimeType,modifiedTime,size)")
-            .append_pair("orderBy", "modifiedTime desc")
-            .append_pair("pageSize", &page_size.to_string());
+        loop {
+            let mut url = self.drive_url()?;
+            url.path_segments_mut()
+                .map_err(|_| AppError::Config("invalid Drive API base".into()))?
+                .push("files");
 
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(token.access_token)
-            .send()
-            .await?
-            .error_for_status()?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                pairs
+                    .append_pair(
+                        "q",
+                        &format!(
+                            "(mimeType='{DRIVE_KML_MIME}' OR mimeType='{DRIVE_MAPS_MIME}') and trashed = false"
+                        ),
+                    )
+                    .append_pair(
+                        "fields",
+                        "nextPageToken, files(id,name,mimeType,modifiedTime,size)",
+                    )
+                    .append_pair("orderBy", "modifiedTime desc")
+                    .append_pair("pageSize", &page_size.to_string());
+                if let Some(token) = &next_page {
+                    pairs.append_pair("pageToken", token);
+                }
+            }
 
-        let files: DriveListResponse = response.json().await?;
-        Ok(files
-            .files
-            .into_iter()
-            .map(DriveFileMetadata::from)
-            .collect())
+            let response = self
+                .http
+                .get(url)
+                .bearer_auth(token.access_token.clone())
+                .send()
+                .await?;
+
+            if let Some(err) = drive_auth_error(response.status()) {
+                return Err(err);
+            }
+            let response = response.error_for_status()?;
+
+            let payload: DriveListResponse = response.json().await?;
+            results.extend(payload.files.into_iter().map(DriveFileMetadata::from));
+
+            if results.len() >= target {
+                break;
+            }
+            match payload.next_page_token {
+                Some(token) => next_page = Some(token),
+                None => break,
+            }
+        }
+
+        results.truncate(target);
+        Ok(results)
     }
 
-    pub async fn download_file<F>(&self, file_id: &str, mut progress: F) -> AppResult<Vec<u8>>
+    pub async fn download_file<F>(
+        &self,
+        file_id: &str,
+        mime_type: Option<&str>,
+        mut progress: F,
+    ) -> AppResult<Vec<u8>>
     where
         F: FnMut(u64, Option<u64>) + Send,
     {
         let token = self.ensure_token().await?;
         let mut url = self.drive_url()?;
-        url.path_segments_mut()
-            .map_err(|_| AppError::Config("invalid Drive API base".into()))?
-            .push("files")
-            .push(file_id);
-        url.set_query(Some("alt=media"));
+        let is_map = matches!(mime_type, Some(mime) if mime == DRIVE_MAPS_MIME);
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| AppError::Config("invalid Drive API base".into()))?;
+            segments.push("files").push(file_id);
+            if is_map {
+                segments.push("export");
+            }
+        }
+        match mime_type {
+            Some(mime) if mime == DRIVE_MAPS_MIME => {
+                url.query_pairs_mut()
+                    .append_pair("mimeType", DRIVE_KML_EXPORT_MIME);
+            }
+            _ => {
+                url.set_query(Some("alt=media"));
+            }
+        }
 
         let response = self
             .http
             .get(url)
             .bearer_auth(token.access_token)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+
+        if let Some(err) = drive_auth_error(response.status()) {
+            return Err(err);
+        }
+        let response = response.error_for_status()?;
 
         let total = response.content_length();
         progress(0, total);
@@ -765,9 +819,7 @@ fn build_code_challenge(verifier: &str) -> AppResult<String> {
     Ok(URL_SAFE_NO_PAD.encode(digest))
 }
 
-async fn handle_loopback_callback(
-    listener: TcpListener,
-) -> Result<AuthCallback, AppError> {
+async fn handle_loopback_callback(listener: TcpListener) -> Result<AuthCallback, AppError> {
     let (mut socket, _) = listener.accept().await?;
     let mut buffer = [0u8; 4096];
     let read = socket.read(&mut buffer).await?;
@@ -828,9 +880,7 @@ async fn handle_loopback_callback(
 }
 
 fn success_body(message: &str) -> String {
-    format!(
-        "<html><body><h3>{message}</h3><p>You can return to the app.</p></body></html>"
-    )
+    format!("<html><body><h3>{message}</h3><p>You can return to the app.</p></body></html>")
 }
 
 fn error_body(message: &str) -> String {
@@ -838,7 +888,6 @@ fn error_body(message: &str) -> String {
         "<html><body><h3>{message}</h3><p>Close this window and restart sign-in.</p></body></html>"
     )
 }
-
 
 #[derive(Deserialize)]
 struct DeviceCodeResponse {
@@ -874,6 +923,8 @@ struct TokenErrorResponse {
 #[derive(Deserialize)]
 struct DriveListResponse {
     files: Vec<DriveFileRaw>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -900,5 +951,15 @@ fn compute_next_refresh(expires_at: DateTime<Utc>) -> DateTime<Utc> {
         target
     } else {
         Utc::now() + Duration::minutes(1)
+    }
+}
+
+fn drive_auth_error(status: StatusCode) -> Option<AppError> {
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        Some(AppError::Config(
+            "Google Drive authorization failed. Re-authenticate to refresh the session.".into(),
+        ))
+    } else {
+        None
     }
 }
